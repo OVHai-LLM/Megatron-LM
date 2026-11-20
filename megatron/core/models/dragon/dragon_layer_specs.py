@@ -1,0 +1,187 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import warnings
+from typing import Optional, Union
+
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from functools import partial
+
+from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.torch_norm import L2Norm
+from megatron.core.dragon.dragon_block import (
+    DragonBlockSubmodules,
+    get_num_layers_to_build,
+)
+from megatron.core.dragon.dragon_attention import SelfDiffAttention, SelfDiffAttentionSubmodules
+from megatron.core.dragon.dragon_attention_v2 import SelfDiffAttentionV2, SelfDiffAttentionV2Submodules
+from megatron.core.dragon.dragon_gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.dragon.dragon_mamba3 import Mamba3Submodules, FastMamba3 #, TPFastMamba3
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+from megatron.core.dragon.dragon_config import DragonConfig
+from megatron.core.dragon.dragon_layer import (
+    DragonLayer,
+    DragonLayerSubmodules,
+    get_dragon_layer_offset,
+)
+from megatron.core.activations import squared_relu
+
+try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
+    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+try:
+    import nvidia_kitchen  # pylint: disable=unused-import
+
+    from megatron.core.extensions.kitchen import KitchenSpecProvider
+
+    HAVE_KITCHEN = True
+except ImportError:
+    HAVE_KITCHEN = False
+
+try:
+    import apex  # pylint: disable=unused-import
+
+    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+
+    HAVE_APEX = True
+    LNImpl = FusedLayerNorm
+except ImportError:
+    import warnings
+
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
+    LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
+
+from megatron.core.extensions.transformer_engine import TELinear, TELayerNormColumnParallelLinear, TEColumnParallelLinear, TERowParallelLinear,TEDotProductAttention, TEColumnParallelGroupedLinear, TERowParallelGroupedLinear
+
+def get_dragon_block_spec(
+    config: DragonConfig,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+):
+    backend = TESpecProvider()
+    if config.dragon_core_attention == "fa4":
+        from megatron.core.dragon.dragon_fa4_attention import FA4DotProductAttention as core_attention
+    else:
+        core_attention = TEDotProductAttention
+    attention = ModuleSpec(
+        module=SelfDiffAttention,
+        params={"attn_mask_type": AttnMaskType.causal if not config.intra_doc_masking else AttnMaskType.padding_causal},
+        submodules=SelfDiffAttentionSubmodules(
+            linear_in=TELayerNormColumnParallelLinear if not config.use_geodesic_norm else TEColumnParallelLinear,
+            linear_BkBv=TELinear,
+            core_attention=core_attention,
+            q_layernorm=TENorm,
+            k_layernorm=TENorm,
+        )
+    )
+    attention_v2 = ModuleSpec(
+        module=SelfDiffAttentionV2,
+        params={"attn_mask_type": AttnMaskType.causal if not config.intra_doc_masking else AttnMaskType.padding_causal},
+        submodules=SelfDiffAttentionV2Submodules(
+            linear_in=TELayerNormColumnParallelLinear if not config.use_geodesic_norm else TEColumnParallelLinear,
+            linear_BkBv=TELinear,
+            core_attention=core_attention,
+            q_layernorm=TENorm,
+            k_layernorm=TENorm,
+        )
+    )
+    gdn = ModuleSpec(
+        module=GatedDeltaNet,
+        submodules=GatedDeltaNetSubmodules(
+            in_proj=TELayerNormColumnParallelLinear,
+        )
+    )
+    mamba3 = ModuleSpec(
+        module=FastMamba3,
+        submodules=Mamba3Submodules(
+            in_proj=TELayerNormColumnParallelLinear if not config.use_geodesic_norm else TEColumnParallelLinear,
+            b_norm=TENorm,
+            c_norm=TENorm,
+            rope_proj=TELinear,
+            output_norm=TENorm if not config.use_geodesic_norm else IdentityOp,
+            dyn_proj=TELinear,
+        ),
+    )
+    if backend.fuse_layernorm_and_linear():
+        fuse_pre_mlp_layernorm = True
+    else:
+        fuse_pre_mlp_layernorm = False
+
+    # MLP.
+    mlp = ModuleSpec(
+        module=MLP,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
+            linear_fc2=TERowParallelLinear,
+            activation_func=backend.activation_func() if config.use_te_activation_func else None,
+        ),
+        metainfo={"fuse_pre_mlp_layernorm": fuse_pre_mlp_layernorm},
+    )
+    # MoE. Megatron-Core >= 0.20: MoESubmodules holds builders (callables), not ModuleSpecs.
+    experts = partial(
+        TEGroupedMLP,
+        submodules=GroupedMLPSubmodules(
+            linear_fc1=TEColumnParallelGroupedLinear, # no layernorm. it's done as a standalone.
+            linear_fc2=TERowParallelGroupedLinear,
+            activation_func=backend.activation_func() if config.use_te_activation_func else None,
+        ),
+    )
+    shared_experts = partial(
+        SharedExpertMLP,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
+            linear_fc2=TERowParallelLinear,
+            activation_func=backend.activation_func() if config.use_te_activation_func else None,
+        ),
+    )
+    moe = ModuleSpec(
+        module=MoELayer,
+        params={},
+        submodules=MoESubmodules(
+            experts=experts,
+            shared_experts=shared_experts,
+        ),
+        metainfo={"fuse_pre_mlp_layernorm": False},  
+    )
+    layer = ModuleSpec(
+        module=DragonLayer,
+        params={},
+        submodules=DragonLayerSubmodules(
+            attention=attention,
+            attention_v2=attention_v2,
+            gdn=gdn,
+            mamba3=mamba3,
+            mixer_norm=TENorm if not config.use_geodesic_norm else IdentityOp,
+            mixer_proj=TERowParallelLinear,
+            pre_mlp_norm=TENorm if not config.use_geodesic_norm else IdentityOp,
+            mlp=mlp,
+            moe=moe,
+        ),
+    )
+    if vp_stage is not None or pp_rank is not None:
+        num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
+    else:
+        num_layers = config.num_layers
+    
+    dragon_block_spec = DragonBlockSubmodules(
+        layer_specs=[layer] * num_layers,
+        final_layer_norm=IdentityOp, #TENorm if not config.normalize_lm_head else IdentityOp,
+    )
+
+    return dragon_block_spec

@@ -37,6 +37,12 @@ except ImportError:
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
+try:
+    # Dragon: AdEMAMix from the OVHai TransformerEngine fork.
+    from transformer_engine.pytorch.optimizers import FusedAdemamix as Ademamix
+except ImportError:
+    Ademamix = None
+
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
@@ -805,8 +811,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Retained only between loading-template creation and load_state_dict().
         self._checkpoint_version_for_load = None
 
+        self.is_ademamix = Ademamix is not None and isinstance(optimizer, Ademamix)
         assert (
             isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
+            or self.is_ademamix
             or optimizer is None
             or init_state_fn is not None
         ), (
@@ -925,7 +933,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def optimizer_state_keys(self):
         """Return the optimizer's tensor state keys, e.g., ('exp_avg', 'exp_avg_sq') for Adam
         or ('exp_avg',) for Lion."""
-        _OPTIMIZER_STATE_KEYS = {"lion": ("exp_avg",)}
+        _OPTIMIZER_STATE_KEYS = {
+            "lion": ("exp_avg",),
+            # Dragon: AdEMAMix keeps a slow EMA next to Adam's two moments.
+            "ademamix": ("exp_avg", "exp_avg_slow", "exp_avg_sq"),
+        }
         optimizer_name = self.config.optimizer
         # When Muon is the top-level optimizer, the DistributedOptimizer wrapping
         # scalar parameters uses muon_scalar_optimizer (e.g., Lion) as the actual
@@ -938,6 +950,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Return the dtype for a given optimizer state key."""
         dtype_map = {
             "exp_avg": self.config.exp_avg_dtype,
+            "exp_avg_slow": self.config.exp_avg_dtype,
             "exp_avg_sq": self.config.exp_avg_sq_dtype,
         }
         return dtype_map.get(key, torch.float32)
@@ -1086,9 +1099,31 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
-            state_dict_param_groups.append(
-                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
-            )
+            if needed_groups in param_groups_map:
+                state_dict_param_groups.append(
+                    {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+                )
+            else:
+                # Param group keys (wd_mult, lr_mult, ...) changed due to LR update.
+                # Fall back to positional (order-based) matching.
+                print(
+                    f"[WARNING] Param group key mismatch during checkpoint load. "
+                    f"Key {needed_groups} not found in checkpoint. "
+                    f"Falling back to order-based param group matching."
+                )
+                ckpt_param_groups = state_dict["optimizer"]["param_groups"]
+                inner_param_groups = inner_state_dict["param_groups"]
+                assert len(ckpt_param_groups) == len(inner_param_groups), (
+                    f"Cannot fall back to order-based matching: checkpoint has "
+                    f"{len(ckpt_param_groups)} param groups but current optimizer "
+                    f"has {len(inner_param_groups)}."
+                )
+                state_dict_param_groups = []
+                for ckpt_pg, inner_pg in zip(ckpt_param_groups, inner_param_groups):
+                    state_dict_param_groups.append(
+                        {**ckpt_pg, "params": inner_pg['params']}
+                    )
+                break
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
@@ -2117,6 +2152,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 tensors[key].shape,
                                 gbuf_local_start,
                                 gbuf_local_end,
+                                key,
                             )
 
                             tensors[key] = ShardedTensor(

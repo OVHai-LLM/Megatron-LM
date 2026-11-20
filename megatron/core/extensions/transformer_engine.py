@@ -13,6 +13,7 @@ import re
 import warnings
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
+import math
 
 import torch
 import torch.nn.functional as F
@@ -68,6 +69,7 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.core.activations import squared_relu
 
 try:
     import transformer_engine as te
@@ -469,6 +471,16 @@ def _get_should_context_be_quantized_params(
         )
 
 
+def _te_alpha_kwargs(module) -> dict:
+    """Dragon (OVHai TE fork): GEMM alpha scaling of the forward / backward, passed to TE's
+    forward only when it is not the identity, so that stock TE keeps working for other models."""
+    alpha_fwd = getattr(module, "alpha_fwd", 1.0)
+    alpha_bwd = getattr(module, "alpha_bwd", 1.0)
+    if alpha_fwd == 1.0 and alpha_bwd == 1.0:
+        return {}
+    return {"alpha_fwd": alpha_fwd, "alpha_bwd": alpha_bwd}
+
+
 def _resolve_is_first_microbatch(module) -> Optional[bool]:
     """The value to pass TE, or ``None`` meaning "no opinion, just accumulate".
 
@@ -702,9 +714,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                             "SiLU activation requires Transformer Engine 2.8+"
                         )
                     layer_type = te.pytorch.ops.SiLU
+                elif config.activation_func == squared_relu:
+                    layer_type = te.pytorch.ops.SReLU
             if layer_type is None:
                 raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU, SiLU are supported by '
+                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU, SiLU, SReLU are supported by '
                     'transformer engine. Please set use_te_activation_func=False'
                 )
             activation_func_kwargs = {}
@@ -1189,6 +1203,7 @@ class TENorm:
         hidden_size: int,
         eps: float = 1e-5,
         has_residual: bool = False,
+        use_weights: bool = True,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1221,6 +1236,8 @@ class TENorm:
             eps=eps,
             sequence_parallel=config.sequence_parallel,
             zero_centered_gamma=config.layernorm_zero_centered_gamma,
+            # Dragon: weightless norms need the OVHai TE fork's `use_weights`
+            **({} if use_weights else {"use_weights": False}),
             **_get_extra_te_kwargs(config),
         )
 
@@ -1261,6 +1278,9 @@ class TELinear(te.pytorch.Linear):
         name: str | None = None,
         gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
         gtp_replica_group: Optional[torch.distributed.ProcessGroup] = None,
+        alpha_fwd: Optional[float] = None,
+        alpha_bwd: Optional[float] = None,
+        uscaling_scaling: Optional[bool] = None,
     ):
         """
         Args:
@@ -1273,6 +1293,7 @@ class TELinear(te.pytorch.Linear):
             )
 
         self.config = config
+        self.row_parallel = True if parallel_mode == "row" else False
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -1287,6 +1308,15 @@ class TELinear(te.pytorch.Linear):
             raise ValueError(
                 "Transformer Engine linear layers do not support skip_weight_param_allocation"
             )
+
+        assert alpha_fwd != 0., "Alpha scaling factor cannot be zero, I mean wtf?"
+        self.alpha_fwd = alpha_fwd or 1.
+        self.alpha_bwd = alpha_bwd or 1.
+        if hasattr(config, 'use_uscaling') and (uscaling_scaling is not False):
+            if config.use_uscaling:
+                scale = 1./math.sqrt(input_size)
+                self.alpha_fwd = self.alpha_fwd * scale
+                self.alpha_bwd = self.alpha_bwd * scale
 
         extra_kwargs = _get_extra_te_kwargs(config)
 
@@ -1464,7 +1494,9 @@ class TELinear(te.pytorch.Linear):
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+            out = super().forward(
+                x, is_first_microbatch=_is_first_microbatch, **_te_alpha_kwargs(self)
+            )
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -1513,12 +1545,16 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         bias: bool,
         skip_bias_add: bool,
         is_expert: bool,
+        return_layernorm_output: bool = False,
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        alpha_fwd: Optional[float] = None,
+        alpha_bwd: Optional[float] = None,
+        uscaling_scaling: Optional[bool] = None,
     ):
         """
         Args:
@@ -1533,6 +1569,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             )
 
         self.config = config
+        self.row_parallel = False
 
         if gather_output:
             raise ValueError("Transformer Engine linear layers do not support gather_output = True")
@@ -1545,6 +1582,15 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 "Transformer Engine linear layers do not support skip_weight_param_allocation"
             )
 
+        assert alpha_fwd != 0., "Alpha scaling factor cannot be zero, I mean wtf?"
+        self.alpha_fwd = alpha_fwd or 1.
+        self.alpha_bwd = alpha_bwd or 1.
+        if hasattr(config, 'use_uscaling') and (uscaling_scaling is not False):
+            if config.use_uscaling:
+                scale = 1./math.sqrt(input_size)
+                self.alpha_fwd = self.alpha_fwd * scale
+                self.alpha_bwd = self.alpha_bwd * scale
+
         # TODO: For backward compatibility, remove in v0.15.
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
@@ -1555,6 +1601,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # ourselves. This way our forward always returns two values
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
+        self.te_return_layernorm_output = return_layernorm_output
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         extra_kwargs = _get_extra_te_kwargs(config)
@@ -1658,7 +1705,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode="column",
-                return_layernorm_output=False,
+                return_layernorm_output=return_layernorm_output,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 **extra_kwargs,
             )
@@ -1720,16 +1767,22 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             x = x.to(self.layer_norm_weight.dtype)
 
         with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+            out = super().forward(
+                x, is_first_microbatch=_is_first_microbatch, **_te_alpha_kwargs(self)
+            )
 
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
         # values regardless of the arguments.
+        bias = None
         if self.te_return_bias:
-            return out
-        return out, None
+            out, bias = out
+        if self.te_return_layernorm_output:
+            out, ln_out = out
+            out = (out, ln_out)
+        return out, bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
@@ -1786,6 +1839,9 @@ class TEColumnParallelLinear(TELinear):
         stride: int = 1,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        alpha_fwd: Optional[float] = None,
+        alpha_bwd: Optional[float] = None,
+        uscaling_scaling: Optional[bool] = None,
     ):
         """
         Args:
@@ -1828,6 +1884,9 @@ class TEColumnParallelLinear(TELinear):
             name=name,
             gtp_remat_group=gtp_remat_group,
             gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            alpha_fwd=alpha_fwd,
+            alpha_bwd=alpha_bwd,
+            uscaling_scaling=uscaling_scaling,
         )
 
         # Set proper partition_stride
@@ -2059,6 +2118,9 @@ class TERowParallelLinear(TELinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        alpha_fwd: Optional[float] = None,
+        alpha_bwd: Optional[float] = None,
+        uscaling_scaling: Optional[bool] = None,
     ):
         """
         Args:
@@ -2101,6 +2163,9 @@ class TERowParallelLinear(TELinear):
             name=name,
             gtp_remat_group=gtp_remat_group,
             gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            alpha_fwd=alpha_fwd,
+            alpha_bwd=alpha_bwd,
+            uscaling_scaling=uscaling_scaling,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -2258,11 +2323,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_type: str,
         attention_dropout: Optional[float] = None,
         softmax_scale: Optional[float] = None,
+        num_attention_heads: Optional[int] = None,
+        num_query_groups: Optional[int] = None,
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
         num_splits: Optional[int] = None,
         cp_comm_type: Optional[str] = "p2p",
         pg_collection: Optional[ProcessGroupCollection] = None,
+        softcap: Optional[float] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -2288,16 +2356,20 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"setting query key layer scaling via argument, so these two must match."
             )
 
+        if num_attention_heads is None:
+            num_attention_heads = self.config.num_attention_heads
+        if num_query_groups is None:
+            num_query_groups = self.config.num_query_groups
+
         extra_kwargs: dict[str, Any] = {}
-        if is_te_min_version("0.11.0"):
-            extra_kwargs["num_gqa_groups"] = self.config.num_query_groups
-        elif self.config.num_query_groups != self.config.num_attention_heads:
-            raise ValueError(
-                f"Transformer Engine v{get_te_version()} does not support Grouped Query Attention, "
-                f"use a newer version of Transformer Engine. "
-                f"(num_query_groups ({self.config.num_query_groups}) != "
-                f"num_attention_heads ({self.config.num_attention_heads}))"
-            )
+        extra_kwargs["num_gqa_groups"] = num_query_groups
+
+        # Dragon: tanh logit softcap (--softcap-attn), TE's native `softcap` (TE >= 2.20; TE then
+        # disables its FusedAttention / FA4 backends, see dragon_fa4_attention.py).
+        if softcap is None:
+            softcap = getattr(self.config, "softcap_attn", 0.0)
+        if softcap:
+            extra_kwargs["softcap"] = softcap
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection(
@@ -2418,6 +2490,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
         # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
         self.kept_packed_seq_params.discard("total_tokens")
+        # Dragon's PackedSeqParams.position_ids is not a TE kwarg
+        self.kept_packed_seq_params.discard("position_ids")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
@@ -2434,7 +2508,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.current_max_attn_logits = None
 
         super().__init__(
-            num_attention_heads=self.config.num_attention_heads,
+            num_attention_heads=num_attention_heads,
             kv_channels=kv_channels,
             attention_dropout=(
                 self.config.attention_dropout if attention_dropout is None else attention_dropout
@@ -2498,6 +2572,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_mask: Optional[Tensor],
         attn_mask_type: AttnMaskType,
         attention_bias: Optional[Tensor] = None,
+        window_size: Optional[Tuple[int, int]] = None,
+        concat_heads: bool = True,
         packed_seq_params: Optional[PackedSeqParams] = None,
         num_splits: Optional[int] = None,
         bf16_backward: Optional[bool] = None,
@@ -2514,6 +2590,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 packed_seq_params=packed_seq_params,
                 num_splits=num_splits,
                 bf16_backward=bf16_backward,
+                window_size=window_size,
+                concat_heads=concat_heads,
             )
 
     def _forward(
@@ -2527,6 +2605,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         packed_seq_params: Optional[PackedSeqParams] = None,
         num_splits: Optional[int] = None,
         bf16_backward: Optional[bool] = None,
+        window_size: Optional[Tuple[int, int]] = None,
+        concat_heads: bool = True,
     ) -> torch.Tensor:
         """Run TE attention after the runtime CP binding has been installed."""
         if packed_seq_params is not None:
@@ -2546,7 +2626,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if packed_seq_params is not None
             else {}
         )
-        qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
+        if packed_seq_params is None:
+            qkv_format = self.qkv_format
+        else:
+            qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
         if attention_bias is not None:
@@ -2580,6 +2663,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 _fa_kwargs["num_splits"] = num_splits
             if bf16_backward is not None:
                 _fa_kwargs["bf16_backward"] = bf16_backward
+            # Dragon: per-call sliding window (SLW schedule)
+            if window_size is not None:
+                _fa_kwargs["window_size"] = window_size
 
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
@@ -2613,6 +2699,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if bf16_backward is not None:
                 _fa_kwargs["bf16_backward"] = bf16_backward
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+
+        if not concat_heads:
+            # Dragon: per-head output, [..., h*d] -> [..., h, d] (h = heads on this TP rank)
+            def _split_heads(t):
+                return t.reshape(*t.shape[:-1], query.shape[-2], -1)
+
+            if isinstance(core_attn_out, tuple):
+                core_attn_out = (_split_heads(core_attn_out[0]),) + tuple(core_attn_out[1:])
+            else:
+                core_attn_out = _split_heads(core_attn_out)
 
         return core_attn_out
 
@@ -2667,12 +2763,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
             name: str | None = None,
+            alpha_fwd: Optional[float] = None,
+            alpha_bwd: Optional[float] = None,
+            uscaling_scaling: Optional[bool] = None,
         ):
             """
             Args:
                 name (str | None): module instance name passed top-down from its paranet module
             """
             self.config = config
+            self.row_parallel = True if parallel_mode == "row" else False
 
             # TE returns a zero length Tensor when bias=False and
             # return_bias=True, but we prefer None.  So in that case we
@@ -2696,6 +2796,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     raise RuntimeError(
                         "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
                     )
+
+            assert alpha_fwd != 0., "Alpha scaling factor cannot be zero, I mean wtf?"
+            self.alpha_fwd = alpha_fwd or 1.
+            self.alpha_bwd = alpha_bwd or 1.
+            if hasattr(config, 'use_uscaling') and (uscaling_scaling is not False):
+                if config.use_uscaling:
+                    scale = 1./math.sqrt(input_size)
+                    self.alpha_fwd = self.alpha_fwd * scale
+                    self.alpha_bwd = self.alpha_bwd * scale
 
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
@@ -2988,7 +3097,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
-                out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+                out = super().forward(
+                    x,
+                    m_splits,
+                    is_first_microbatch=_is_first_microbatch,
+                    **_te_alpha_kwargs(self),
+                )
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
@@ -3190,6 +3304,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
             name: str | None = None,
+            alpha_fwd: Optional[float] = None,
+            alpha_bwd: Optional[float] = None,
+            uscaling_scaling: Optional[bool] = None,
         ):
             """
             Args:
@@ -3208,6 +3325,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 pg_collection=pg_collection,
                 name=name,
+                alpha_fwd=alpha_fwd,
+                alpha_bwd=alpha_bwd,
+                uscaling_scaling=uscaling_scaling,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -3242,6 +3362,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
             name: str | None = None,
+            alpha_fwd: Optional[float] = None,
+            alpha_bwd: Optional[float] = None,
+            uscaling_scaling: Optional[bool] = None,
         ):
             """
             Args:
@@ -3260,6 +3383,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 pg_collection=pg_collection,
                 name=name,
+                alpha_fwd=alpha_fwd,
+                alpha_bwd=alpha_bwd,
+                uscaling_scaling=uscaling_scaling,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -3987,6 +4113,7 @@ try:
         bias: Optional[torch.Tensor] = None,
         grad: bool = False,
         accumulate: bool = False,
+        alpha: float = 1.0,
     ) -> List[torch.Tensor]:
         """
         Wrapper for TE's general_gemm function.
@@ -4015,6 +4142,8 @@ try:
             extra_output=None,
             bulk_overlap=False,
         )
+        if alpha != 1.0:
+            kwargs["alpha"] = alpha  # Dragon: alpha-scaled GEMM (router / latent MoE)
         if _get_workspace is not None:
             kwargs["workspace"] = _get_workspace()
         return general_gemm(A, B, **kwargs)

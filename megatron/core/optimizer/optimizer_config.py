@@ -149,6 +149,27 @@ class OptimizerConfig:
        iteration would be different.
     """
 
+    lr_mult_emb: Optional[float] = None
+    """Learning rate multiplier for embedding layers. uscaling only"""
+
+    lr_mult_scalar: Optional[float] = None
+    """Learning rate multiplier for scalar parameters (e.g., layernorm and bias). uscaling only"""
+
+    lr_mult_head: Optional[float] = None
+    """Learning rate multiplier for output head layers. uscaling only"""
+
+    lr_emb: Optional[float] = None
+    """Initial learning rate for embedding layers. completedp only"""
+
+    lr_scalar: Optional[float] = None
+    """Initial learning rate for scalar parameters (e.g., layernorm and bias). completedp only"""
+
+    lr_head: Optional[float] = None
+    """Initial learning rate for output head layers. completedp only"""
+
+    lr_expert: Optional[float] = None
+    """Initial learning rate for routed expert layers. completedp only"""
+
     min_lr: Optional[float] = None
     """Minumum value for learning rate. The scheduler clip values below this threshold."""
 
@@ -208,7 +229,7 @@ class OptimizerConfig:
     """dtype of exp_avg_sq when enabling precision-aware-optimizer"""
 
     optimizer: str = 'adam'
-    """Optimizer name (e.g., 'adam', 'sgd', 'muon'). Can be overridden per-parameter group
+    """Optimizer name (e.g., 'adam', 'ademamix' (Dragon, TE fork's FusedAdemamix), 'sgd', 'muon'). Can be overridden per-parameter group
     via config_overrides to use different optimizers for different parameters."""
 
     ###############
@@ -245,13 +266,18 @@ class OptimizerConfig:
     optimizer.
     """
 
-    adam_eps: float = 1e-08
+    adam_eps: float = 1e-8
     """Term added to the denominator to improve numerical stability in Adam optimizer."""
 
     decoupled_weight_decay: bool = True
     """If true, decouples weight decay from the gradient update, equivalent to AdamW. If false,
     original Adam update rule will be used. Defaults to True.
     """
+
+    # Ademamix
+    ademamix_beta3: float = 0.9999
+
+    ademamix_alpha: float = 8.0
 
     # SGD.
     sgd_momentum: float = 0.9
@@ -483,8 +509,8 @@ class OptimizerConfig:
 
         if self.use_precision_aware_optimizer:
             assert (
-                self.optimizer == 'adam'
-            ), '--use-precision-aware-optimizer only supported with adam'
+                self.optimizer in ('adam', 'ademamix')
+            ), '--use-precision-aware-optimizer only supported with adam or ademamix'
             if not is_te_min_version("2.1.0"):
                 self.store_param_remainders = False
 

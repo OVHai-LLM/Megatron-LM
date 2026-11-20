@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional, Protocol, cast
 
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -137,6 +138,14 @@ class LinearFc2Builder(Protocol):
         ...
 
 
+
+def dragon_alpha_kwargs(alpha: Optional[float]) -> dict:
+    """Dragon: alpha_fwd / alpha_bwd GEMM scaling for TE linear layers (OVHai TE fork), only when
+    it is not the identity, so that other linear implementations keep their signature."""
+    if alpha is None or alpha == 1.0:
+        return {}
+    return {"alpha_fwd": alpha, "alpha_bwd": alpha}
+
 @dataclass
 class MLPSubmodules:
     """
@@ -178,6 +187,7 @@ class MLP(MegatronModule):
         is_expert: bool = False,
         input_size: Optional[int] = None,
         ffn_hidden_size: Optional[int] = None,
+        input_scalar: float = 1.0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -226,6 +236,7 @@ class MLP(MegatronModule):
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
+            **dragon_alpha_kwargs(input_scalar),
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
@@ -239,6 +250,8 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
+        # Dragon (u-muP): fc2 alpha GEMM
+        fc2_alpha = 2 / math.sqrt(5) if getattr(self.config, 'use_uscaling', False) else None
         self.linear_fc2 = submodules.linear_fc2(
             not_none(self.config.ffn_hidden_size),
             not_none(
@@ -254,6 +267,7 @@ class MLP(MegatronModule):
             tp_group=tp_group,
             pg_collection=pg_collection,
             name=(name + ".linear_fc2") if name is not None else None,
+            **dragon_alpha_kwargs(fc2_alpha),
         )
 
     def forward(
@@ -396,6 +410,8 @@ class MLP(MegatronModule):
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
+            if name == 'activation_func':
+                continue  # Dragon: TE activation ops carry only _extra_state
             sub_sd = sharded_state_dict_default(
                 module, f"{prefix}{name}.", sharded_offsets, metadata
             )

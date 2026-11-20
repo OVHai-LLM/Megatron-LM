@@ -40,6 +40,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        generates masks by itself.
     """
 
+    create_cu_seqlens: bool = False
+    """Option to enable generation of cu_seqlens and max_seqlen. (used for Dragon's IDM)"""
+
     drop_last_partial_validation_sequence: bool = True
     """Option to drop the last partial validation sequence"""
 
@@ -110,6 +113,19 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     TODO: drop this field once a functional test covers THD-vs-SBHD numerical
     parity in CI."""
 
+    mask_repeated_ngrams: bool = True
+    """Option to mask the loss for tokens that belong to highly-repeated n-grams
+    (following OLMo-style training stabilization). When enabled, any token position
+    that is part of an n-gram repeated at least `mask_repeated_ngrams_min_repeats`
+    consecutive times will have its loss masked to 0.
+    """
+
+    mask_repeated_ngrams_max_n: int = 13
+    """Maximum n-gram size to check for repetitions (1 to max_n inclusive)."""
+
+    mask_repeated_ngrams_min_repeats: int = 32
+    """Minimum number of consecutive repetitions of an n-gram to trigger masking."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -173,6 +189,7 @@ class GPTDataset(MegatronDataset):
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
+                self.config.create_cu_seqlens,
             ]
         )
         self.masks_and_position_ids_are_cached = False
@@ -290,13 +307,14 @@ class GPTDataset(MegatronDataset):
             not self.masks_and_position_ids_are_cacheable
             or not self.masks_and_position_ids_are_cached
         ):
-            attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
+            attention_mask, loss_mask, position_ids, cu_seqlens, max_seqlen = _get_ltor_masks_and_position_ids(
                 tokens,
                 self.config.tokenizer.eod,
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
                 self.config.create_attention_mask,
+                self.config.create_cu_seqlens,
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
@@ -307,9 +325,22 @@ class GPTDataset(MegatronDataset):
             attention_mask = self.cached_attention_mask
             loss_mask = self.cached_loss_mask.clone()
             position_ids = self.cached_position_ids
+            cu_seqlens = None
+            max_seqlen = None
 
         # For padded sequences, mask the loss
         loss_mask[labels == self._pad_token_id] = 0.0
+
+        # Mask loss for tokens that belong to highly-repeated n-grams (OLMo-style stabilization).
+        # Tokens in degenerate repetitive spans are zeroed out so the model does not learn
+        # from them, preventing loss spikes caused by near-infinite-entropy sequences.
+        if self.config.mask_repeated_ngrams:
+            ngram_mask = _get_repeated_ngram_loss_mask(
+                labels.numpy(),
+                max_n=self.config.mask_repeated_ngrams_max_n,
+                min_repeats=self.config.mask_repeated_ngrams_min_repeats,
+            )
+            loss_mask[torch.from_numpy(ngram_mask)] = 0.0
 
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
@@ -319,7 +350,20 @@ class GPTDataset(MegatronDataset):
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
 
-        if self.config.inter_document_masking:
+        if self.config.create_cu_seqlens:
+            # Dragon IDM: unpadded cu_seqlens / max_seqlen from the EOD positions
+            # (_get_ltor_masks_and_position_ids), consumed by pretrain_dragon's get_batch.
+            result = {
+                "tokens": tokens,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "position_ids": position_ids,
+                "cu_seqlens": cu_seqlens,
+                "max_seqlen": max_seqlen,
+            }
+            if self.config.create_attention_mask:
+                result["attention_mask"] = attention_mask
+        elif self.config.inter_document_masking:
             # document_lengths come from _query_document_sample_shuffle_indices
             # which fetches sequence_length + add_extra_token_to_sequence tokens
             # total. The extra token is appended to the last document part (used
@@ -753,10 +797,11 @@ def _build_document_index(
     """
 
     if not separate_final_epoch or num_epochs == 1:
-        document_index = numpy.mgrid[0:num_epochs, 0 : len(documents)][1]
-        document_index[:] = documents
-        document_index = document_index.reshape(-1)
-        document_index = document_index.astype(numpy.int32)
+        # Use tile instead of mgrid to avoid a ~297 GB int64 intermediate allocation.
+        # mgrid[0:N, 0:M] creates two (N,M) int64 arrays; tile directly produces int32.
+        document_index = numpy.tile(
+            numpy.asarray(documents, dtype=numpy.int32), num_epochs
+        )
         numpy_random_state.shuffle(document_index)
         return document_index
 
@@ -797,6 +842,79 @@ def _build_shuffle_index(
     return numpy.concatenate((shuffle_idx_first, shuffle_idx_last))
 
 
+def _get_repeated_ngram_loss_mask(
+    tokens: numpy.ndarray, max_n: int = 13, min_repeats: int = 32
+) -> numpy.ndarray:
+    """Return a boolean mask (True = should be masked) for tokens in highly-repeated n-grams.
+
+    For each n in [1, max_n], we find positions where the same n-gram is repeated at least
+    `min_repeats` consecutive times. All token positions covered by such a run are marked True.
+
+    Follows the OLMo approach for training stabilization: mask the loss on degenerate
+    repetitive sequences that can cause loss spikes.
+
+    Args:
+        tokens (numpy.ndarray): 1-D int array of token ids (the *input* tokens, i.e. labels).
+        max_n (int): Maximum n-gram size to check (inclusive).
+        min_repeats (int): Minimum number of consecutive repetitions to trigger masking.
+
+    Returns:
+        numpy.ndarray: Boolean array of same length as tokens.  True = mask this position's loss.
+    """
+    L = len(tokens)
+    mask = numpy.zeros(L, dtype=numpy.bool_)
+
+    for n in range(1, max_n + 1):
+        total_span = n * min_repeats
+        if total_span > L:
+            continue
+
+        if n == 1:
+            # Special fast path for unigrams: find runs of identical tokens
+            eq = numpy.equal(tokens[:-1], tokens[1:])  # length L-1
+            if not numpy.any(eq):
+                continue
+            # Pad to find run boundaries
+            padded = numpy.concatenate(([False], eq, [False]))
+            diffs = numpy.diff(padded.astype(numpy.int8))
+            starts = numpy.where(diffs == 1)[0]
+            ends = numpy.where(diffs == -1)[0]
+            run_lengths = ends - starts  # number of *equalities*, actual run = +1
+            for s, rl in zip(starts, run_lengths):
+                actual_run = rl + 1  # number of identical tokens in this run
+                if actual_run >= min_repeats:
+                    mask[s : s + actual_run] = True
+        else:
+            # For n-grams of size n: tokens[i:i+n] == tokens[i+n:i+2n] means positions
+            # i..i+n-1 repeat.  We check if tokens[j] == tokens[j+n] for all j in a window.
+            eq_shift = numpy.equal(tokens[:-n], tokens[n:]).astype(numpy.int8)  # length L-n
+            needed = (min_repeats - 1) * n  # number of consecutive True's required
+
+            if len(eq_shift) < needed:
+                continue
+
+            # Sliding window sum via cumsum
+            cs = numpy.cumsum(eq_shift)
+            window_sum = numpy.empty(len(eq_shift) - needed + 1, dtype=numpy.int64)
+            window_sum[0] = cs[needed - 1]
+            window_sum[1:] = cs[needed:] - cs[: len(cs) - needed]
+
+            # Positions where the full window matches
+            match_positions = numpy.where(window_sum == needed)[0]
+            if len(match_positions) == 0:
+                continue
+
+            # Greedily mark non-overlapping spans
+            prev = -total_span
+            for pos in match_positions:
+                if pos >= prev + total_span:
+                    # This span covers tokens[pos : pos + total_span]
+                    mask[pos : pos + total_span] = True
+                    prev = pos
+
+    return mask
+
+
 def _get_ltor_masks_and_position_ids(
     data: torch.Tensor,
     eod_token: int,
@@ -804,13 +922,14 @@ def _get_ltor_masks_and_position_ids(
     reset_attention_mask: bool,
     eod_mask_loss: bool,
     create_attention_mask: bool,
+    create_cu_seqlens: bool,
 ):
     """Build masks and position id for left to right model.
 
     Args:
         data (torch.Tensor): The data tenor that holds the tokens from the dataset
 
-        eod_token (int): ID of the token to that is considered the EOD
+        eod_token (int): ID of the token to that is considered the EOD, treated as the first token of each doc
 
         reset_position_ids (bool): Switch to reset the document position ID's
 
@@ -821,6 +940,8 @@ def _get_ltor_masks_and_position_ids(
         create_attention_mask (bool): Switch to enable the attention masks generation. Can be
             disabled if attention kernel generates masks by itself.
 
+        create_cu_seqlens (bool): Switch to enable generation of cu_seqlens and max_seqlen. (used for Dragon's IDM. also, please disable create_attention_mask.)
+
     Returns:
         torch.Tensor: Attention mask needed to be used for Attention
 
@@ -829,6 +950,32 @@ def _get_ltor_masks_and_position_ids(
         torch.Tensor: The position ID's of the token
     """
     seq_length = data.numel()
+
+    cu_seqlens = None
+    max_seqlen = None
+
+    eod_positions = (data == eod_token).nonzero(as_tuple=False).view(-1)
+
+    if create_cu_seqlens:
+        starts = [0]
+
+        if eod_positions.numel() > 0:
+            for pos in eod_positions.tolist():
+                if pos > 0:
+                    starts.append(pos)
+
+        starts_t = torch.tensor(starts, dtype=torch.int64, device=data.device)
+        ends_t = torch.cat(
+            [starts_t[1:], torch.tensor([seq_length], dtype=torch.int64, device=data.device)],
+            dim=0,
+        )
+        seqlens = (ends_t - starts_t).to(torch.int32)
+        cu_seqlens = torch.cat(
+            [torch.zeros(1, dtype=torch.int32, device=data.device),
+             seqlens.cumsum(0)],
+            dim=0,
+        ) # cu_seqlens: [0, len(doc0), len(doc0)+len(doc1), ...]
+        max_seqlen = int(seqlens.max().item()) if seqlens.numel() > 0 else 0
 
     if create_attention_mask:
         attention_mask = torch.tril(
@@ -844,34 +991,56 @@ def _get_ltor_masks_and_position_ids(
 
     # Position ids.
     position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
-    # We need to clone as the ids will be modifed based on batch index.
     if reset_position_ids:
         position_ids = position_ids.clone()
 
     if reset_position_ids or reset_attention_mask:
-        # Find indices where EOD token is.
-        eod_index = position_ids[data == eod_token]
-        # Detach indices from positions if going to modify positions.
-        if reset_position_ids:
-            eod_index = eod_index.clone()
+        # Detach indices if going to modify positions.
+        eod_indices = eod_positions.clone() if reset_position_ids else eod_positions
 
-        # Loop through EOD indices:
-        prev_index = 0
-        for j in range(eod_index.numel()):
-            i = eod_index[j]
-            # Mask attention loss.
+        # Track where the current document started to calculate the shift
+        prev_doc_start = 0
+        
+        for j in range(eod_indices.numel()):
+            i = eod_indices[j]
+            
+            # Skip if EOD is at index 0 (it's already pos_id 0, no reset needed)
+            if i == 0:
+                continue
+
+            # CHANGE: Mask attention at 'i', not 'i+1'. 
+            # Token 'i' (Start of Doc B) cannot see 'i-1' (End of Doc A).
             if reset_attention_mask and attention_mask is not None:
-                attention_mask[0, (i + 1) :, : (i + 1)] = 0
-            # Reset positions.
+                attention_mask[0, i:, :i] = 0
+            
+            # CHANGE: Reset positions at 'i'.
+            # We want position_ids[i] to become 0.
             if reset_position_ids:
-                position_ids[(i + 1) :] -= i + 1 - prev_index
-                prev_index = i + 1
-
+                # The current value at position_ids[i] tells us the global index (roughly).
+                # We subtract enough to bring position_ids[i] down to 0.
+                # We calculate the shift based on the logical start of this new doc (i).
+                
+                # Calculate how much to shift: 
+                # We want the new sequence to act as if it started at 0.
+                # So we subtract the previous accumulation.
+                # Easier approach: shift everything from i onwards by the value OF i relative to previous reset.
+                
+                # Current value of pos_ids[i] is (i - cumulative_shift_so_far). 
+                # We want it to be 0. So we subtract (i - cumulative_shift_so_far).
+                current_val = position_ids[i].item()
+                position_ids[i:] -= current_val
+                
     if attention_mask is not None:
-        # Convert attention mask to binary:
         attention_mask = attention_mask < 0.5
 
-    return attention_mask, loss_mask, position_ids
+    #print("eod token", eod_token)
+    #print("reset_position_ids", reset_position_ids)
+    #print("reset_attention_mask", reset_attention_mask)
+    #print("eod_mask_loss", eod_mask_loss)
+    #print("create_attention_mask", create_attention_mask)
+    #print("create_cu_seqlens", create_cu_seqlens)
+
+    return attention_mask, loss_mask, position_ids, cu_seqlens, max_seqlen
 
 
 class MockGPTLowLevelDataset:

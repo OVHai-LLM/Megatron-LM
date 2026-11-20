@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
+import math
 
 import torch
 
@@ -69,6 +70,7 @@ class Router(ABC, MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         hash_moe_layer_threshold: Optional[int] = None,
+        input_scalar: float = 1.0,
     ) -> None:
         """
         Initialize the Router module.
@@ -90,7 +92,18 @@ class Router(ABC, MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
+        self.input_scalar = input_scalar
 
+        router_type = getattr(self.config, 'moe_router_type', 'classic')
+        if router_type == 'dragon':
+            # Dragon's MLP router (experimental; its gating is disabled, see dragon_gating)
+            from megatron.core.dragon.dragon_router_mlp import DragonRouterMLP
+
+            self.dragon_router = DragonRouterMLP(config=self.config)
+            self.calculate_per_token_loss = self.config.calculate_per_token_loss
+            self.reset_parameters()
+            return
+        assert router_type == 'classic', f"unknown moe_router_type {router_type}"
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
         self.weight = torch.nn.Parameter(
@@ -113,6 +126,10 @@ class Router(ABC, MegatronModule):
 
     def reset_parameters(self):
         """Reset the router parameters."""
+        if hasattr(self, 'dragon_router'):
+            for param in self.dragon_router.parameters():
+                setattr(param, 'sequence_parallel', self.config.sequence_parallel)
+            return
         if self.config.perform_initialization:
             self.config.init_method(self.weight)
             if self.bias is not None:
@@ -132,6 +149,8 @@ class Router(ABC, MegatronModule):
         Returns:
             torch.Tensor: Logits tensor.
         """
+        if hasattr(self, 'dragon_router'):
+            return self.dragon_gating(input)
         if self.weight.device.type == 'cpu':
             # move weights to GPU
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
@@ -144,8 +163,16 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
+        # Dragon: the layer input scalar (and u-muP 1/sqrt(fan_in)) as the router GEMM's alpha
+        alpha = self.input_scalar
+        if getattr(self.config, 'use_uscaling', False):
+            alpha = alpha / math.sqrt(self.weight.shape[1])
+        logits = router_gating_linear(input, self.weight, self.bias, router_dtype, alpha=alpha)
         return logits
+
+    def dragon_gating(self, input: torch.Tensor):
+        """Gating of Dragon's MLP router (disabled in Dragon v1.5)."""
+        raise NotImplementedError("moe_router_type='dragon' gating is disabled")
 
     @abstractmethod
     def routing(self, logits: torch.Tensor):
@@ -199,6 +226,7 @@ class TopKRouter(Router):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         hash_moe_layer_threshold: Optional[int] = None,
+        input_scalar: float = 1.0,
     ) -> None:
         """Initialize the zero token dropping router.
 
@@ -212,6 +240,7 @@ class TopKRouter(Router):
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
             hash_moe_layer_threshold=hash_moe_layer_threshold,
+            input_scalar=input_scalar,
         )
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
@@ -243,6 +272,29 @@ class TopKRouter(Router):
                     device=torch.cuda.current_device(),
                 ),
             )
+            # PID controller state buffers (non-persistent: they start from zero on
+            # restart, which is fine — the controller converges quickly. Making them
+            # non-persistent avoids checkpoint compatibility issues when switching
+            # mid-training from sign-based bias to PID.)
+            if getattr(self.config, 'moe_router_bias_use_pid', False):
+                self.register_buffer(
+                    'pid_error_integral',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    'pid_prev_error',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                    persistent=False,
+                )
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
@@ -364,6 +416,12 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
+        if hasattr(self, 'pid_error_integral') and self.pid_error_integral is not None:
+            if self.pid_error_integral.dtype != torch.float32:
+                self.pid_error_integral.data = self.pid_error_integral.data.to(torch.float32)
+        if hasattr(self, 'pid_prev_error') and self.pid_prev_error is not None:
+            if self.pid_prev_error.dtype != torch.float32:
+                self.pid_prev_error.data = self.pid_prev_error.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.

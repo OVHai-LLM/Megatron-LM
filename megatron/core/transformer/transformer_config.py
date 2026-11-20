@@ -68,6 +68,8 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # model architecture
     ####################
+    use_uscaling: bool = False
+    use_completedp: bool = False
 
     num_layers: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer layers in a transformer block."""
@@ -484,6 +486,19 @@ class TransformerConfig(ModelParallelConfig):
     1.0 may avoid loss spikes in training. Setting this to any value will also skip applying
     weight decay on embedding weights to avoid shrinkage towards zero.
     See https://arxiv.org/abs/2312.16903 for more details.
+    """
+
+    normalize_embeddings: bool = False
+    """
+    If True, normalize the embedding output and scale by sqrt(hidden_size).
+    This applies L2 normalization along the last dimension followed by scaling.
+    """
+
+    normalize_lm_head: bool = False
+    """
+    If True, use cosine similarity with a learned temperature for the output logits.
+    Normalizes both hidden states and output layer weights before computing logits,
+    then scales by exp(temperature). The temperature is initialized to log(sqrt(hidden_size)).
     """
 
     init_model_with_meta_device: bool = False
@@ -939,6 +954,19 @@ class TransformerConfig(ModelParallelConfig):
     `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
     updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
     no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
+    moe_router_bias_use_pid: bool = False
+    """Use a PID controller instead of the sign-based step for expert bias updates.
+    When enabled, the bias update uses proportional-integral-derivative control
+    on the normalized load imbalance error for smoother convergence to equilibrium."""
+
+    moe_router_bias_pid_kp: float = 1e-3
+    """Proportional gain for the PID expert bias controller."""
+
+    moe_router_bias_pid_ki: float = 1e-4
+    """Integral gain for the PID expert bias controller."""
+
+    moe_router_bias_pid_kd: float = 1e-4
+    """Derivative gain for the PID expert bias controller."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 

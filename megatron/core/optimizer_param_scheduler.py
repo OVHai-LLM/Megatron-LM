@@ -98,7 +98,7 @@ def combine_param_group_overrides(
 
 
 class OptimizerParamScheduler:
-    """Anneals learning rate and weight decay
+    """Anneals learning rate and weight decay, ramps up window size, controls Ademamix beta3 and alpha.
 
     Args:
         optimizer (MegatronOptimizer): the optimizer to be used
@@ -112,6 +112,21 @@ class OptimizerParamScheduler:
         end_wd (float): final weight decay
         wd_incr_steps (int): number of weight decay increment steps
         wd_incr_style (str): weight decay increment style
+        slw_warmup_steps (int, optional): number of steps to warmup the sliding window over
+        slw_warmup_offset (int, optional): training iteration at which the sliding-window
+            warmup starts. Before this iter, window == slw_start. Useful for
+            ramping the window during a continuation (e.g. annealing) phase.
+        slw_start (int, optional): starting window size for sliding window
+        slw_end (int, optional): ending window size for sliding window
+        slw_increment (int, optional): increment for sliding window
+        global_batch_size (int, optional): global batch size
+        optim (str): optimizer type (used for Ademamix parameters)
+        beta1 (float, optional): Adam beta1 parameter
+        beta2 (float, optional): Adam beta2 parameter
+        beta3 (float, optional): Ademamix beta3 parameter
+        alpha (float, optional): Ademamix alpha parameter
+        beta3_warmup_steps (int, optional): number of steps to warmup beta3 to its target value
+        alpha_warmup_steps (int, optional): number of steps to warmup alpha to its target value
         use_checkpoint_opt_param_scheduler (bool, optional): whether to use the checkpoint values
             for the optimizer param scheduler
         override_opt_param_scheduler (bool, optional): whether to override the optimizer param
@@ -135,6 +150,21 @@ class OptimizerParamScheduler:
         end_wd: float,
         wd_incr_steps: int,
         wd_incr_style: str,
+        slw_warmup_steps: int = 0,
+        slw_warmup_offset: int = 0,
+        slw_start: int = 0,
+        slw_end: int = 0,
+        slw_increment: int = 0,
+        global_batch_size: int = 0,
+        optim: str = 'adam',
+        beta1: Optional[float] = None,
+        beta2: Optional[float] = None,
+        beta3: Optional[float] = None,
+        alpha: Optional[float] = None,
+        beta3_warmup_steps: Optional[int] = None,
+        alpha_warmup_steps: Optional[int] = None,
+        use_completedp: Optional[bool] = False,
+        rhosq_adjusted: Optional[float] = 1.0,
         use_checkpoint_opt_param_scheduler: Optional[bool] = True,
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
@@ -169,6 +199,24 @@ class OptimizerParamScheduler:
         assert self.end_wd >= self.start_wd
         self.wd_incr_steps = wd_incr_steps
         self.wd_incr_style = wd_incr_style
+
+        self.slw_warmup_steps = slw_warmup_steps
+        self.slw_warmup_offset = slw_warmup_offset
+        self.slw_start = slw_start
+        self.slw_end = slw_end
+        self.slw_increment = slw_increment
+        self.global_batch_size = global_batch_size
+
+        self.ademamix = (optim == 'ademamix')
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.beta3 = beta3
+        self.alpha = alpha
+        self.beta3_warmup_steps = beta3_warmup_steps
+        self.alpha_warmup_steps = alpha_warmup_steps
+
+        self.use_completedp = use_completedp
+        self.rhosq_adjusted = rhosq_adjusted
 
         self.override_opt_param_scheduler = override_opt_param_scheduler
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
@@ -281,6 +329,31 @@ class OptimizerParamScheduler:
 
         return min_lr + coeff * delta_lr
 
+    def get_wsize(self) -> int:
+        if self.slw_warmup_steps == 0:
+            return self.slw_end
+        current_iter = self.num_steps / self.global_batch_size
+        progress_ratio = (current_iter - self.slw_warmup_offset) / self.slw_warmup_steps
+        progress_ratio = max(0.0, min(1.0, progress_ratio))  # clamp to [0, 1]
+        window = self.slw_start + progress_ratio * (self.slw_end - self.slw_start) # linear scheduling
+        window = self.slw_increment * math.ceil(window / self.slw_increment) # quantize
+        window = int(min(window, self.slw_end)) # cap
+
+        return window
+    
+    def get_beta3(self) -> float:
+        p = self.num_steps / (self.global_batch_size * self.beta3_warmup_steps)
+        p = min(1.0, max(0.0, p))
+        num = math.log(self.beta1) * math.log(self.beta3)
+        den = (1 - p) * math.log(self.beta3) + p * math.log(self.beta1)
+        beta = math.exp(num / den)
+        return min(beta, self.beta3)
+
+    def get_alpha(self) -> float:
+        p = self.num_steps / (self.global_batch_size * self.alpha_warmup_steps)
+        p = min(1.0, max(0.0, p))
+        return p * self.alpha
+
     def step(self, increment: int) -> None:
         """Set lr for all parameters groups.
 
@@ -293,11 +366,20 @@ class OptimizerParamScheduler:
         # This is important for logging under model parallelism that may leave
         # some ranks with empty default_config parameter groups.
         for param_group in self.optimizer.param_groups:
+            # Dragon: per-group lr_mult (uscaling / CompleteDP groups) multiplies the scheduled LR;
+            # upstream groups carry lr_mult == 1.0.
+            new_lr = self.get_lr(param_group) * param_group.get('lr_mult', 1.0)
             if isinstance(param_group.get('lr'), torch.Tensor):
-                param_group['lr'].fill_(self.get_lr(param_group))
+                param_group['lr'].fill_(new_lr)
             else:
-                param_group['lr'] = self.get_lr(param_group)
+                param_group['lr'] = new_lr
             param_group['weight_decay'] = self.get_wd(param_group) * param_group.get('wd_mult', 1.0)
+            # Dragon: AdEMAMix beta3 / alpha warmups (betas only when the scheduler was given them).
+            if self.ademamix:
+                param_group['alpha'] = self.get_alpha()
+                param_group['betas'] = (self.beta1, self.beta2, self.get_beta3())
+            elif self.beta1 is not None and self.beta2 is not None:
+                param_group['betas'] = (self.beta1, self.beta2)
 
     def state_dict(self) -> dict:
         """Return the state dict."""

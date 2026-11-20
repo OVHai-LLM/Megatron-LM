@@ -88,6 +88,10 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 
     parser = _add_fault_injector_args(parser)
 
+    # Dragon (OVHai): last, so that options upstream now generates from its config dataclasses
+    # (e.g. TransformerConfig fields added for Dragon) are not registered twice.
+    parser = _add_dragon_args(parser)
+
     return parser
 
 def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
@@ -488,6 +492,9 @@ def validate_args(args, defaults={}):
 
     if args.attention_backend == AttnBackend.local:
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
+
+    # seq length
+    #assert args.seq_length == args.training_sequence_length == args.max_position_embeddings
 
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
@@ -1011,6 +1018,16 @@ def validate_args(args, defaults={}):
     if args.fp4 and args.fp8:
         raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
 
+    # FP8 MLP-only requires FP8 mode and non-delayed recipe
+    if args.fp8_mlp_only:
+        if not args.fp8:
+            raise ValueError("--fp8-mlp-only requires --fp8-format to be set.")
+        if args.fp8_recipe == "delayed":
+            raise ValueError(
+                "--fp8-mlp-only does not support --fp8-recipe delayed. "
+                "Use --fp8-recipe tensorwise, blockwise, or mxfp8 instead."
+            )
+
     # FP4 param requires FP4 mode
     if args.fp4_param_gather and not args.fp4:
         raise ValueError("--fp4-param-gather must be used together with --fp4-format.")
@@ -1365,7 +1382,8 @@ def validate_args(args, defaults={}):
     # across batches/microbatches. Due to additional communication overhead
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
-    args.variable_seq_lengths = False
+    # Dragon: SFT batches may have variable lengths.
+    args.variable_seq_lengths = args.sft
     if args.mock_data and args.sft and args.sft_mock_dataset_config_json is None:
         args.sft_mock_dataset_config_json = json.dumps(
             {
@@ -1708,7 +1726,7 @@ def validate_args(args, defaults={}):
             f"(got --optimizer {args.optimizer}). Other optimizers, including "
             "adaptive_muon, do not implement layer sharding."
         )
-    if args.optimizer not in ('sgd', 'adam'):
+    if args.optimizer not in ('sgd', 'adam', 'ademamix'):  # Dragon: AdEMAMix is a regular (distributed) optimizer
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -1995,6 +2013,10 @@ def validate_args(args, defaults={}):
     if args.moe_latent_size is not None:
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
+
+    if args.artificial_seq_len:
+        assert args.training_sequence_length % args.artificial_seq_len == 0, "For artificial sequence length, sequence length must be divisible by the artificial sequence length."
+        assert args.micro_batch_size == 1, "artificial_seq_len only supports micro batch size of 1."
 
     # Print arguments.
     _print_args("arguments", args)
@@ -2541,6 +2563,124 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.')
     return parser
 
+def _add_dragon_args(parser):
+    """Dragon (OVHai) arguments.
+
+    Called last in add_megatron_arguments: an option that upstream already registers (e.g. through
+    the TransformerConfig ArgumentGroupFactory, when a Dragon field lives in TransformerConfig)
+    is skipped instead of raising an argparse conflict.
+    """
+    group = parser.add_argument_group(title='dragon')
+    _add = group.add_argument
+
+    def _add_argument(*option_strings, **kwargs):
+        if any(o in parser._option_string_actions for o in option_strings):
+            return None
+        return _add(*option_strings, **kwargs)
+
+    group.add_argument = _add_argument
+    group.add_argument('--is-dragon-model', action='store_true')
+    group.add_argument('--layers-mixer-config', type=str, default='gggTggg')
+    group.add_argument('--num-first-mlp', type=int, default=0)
+    group.add_argument('--use-value-embeddings', action='store_true')
+    group.add_argument('--layers-ve-config', type=str, default='0001000')
+    group.add_argument('--num-signal-heads', type=int, default=12)
+    group.add_argument('--tpa-rank', type=int, default=4)
+    group.add_argument('--token-shift', action='store_true')
+    group.add_argument('--gate-attn', action='store_true')
+    group.add_argument('--gate-gdn', action='store_true')
+    group.add_argument('--softcap-attn', type=float, default=0.)
+    group.add_argument('--dragon-core-attention', choices=['te', 'fa4'], default='te',
+                       help='Kernel of the attention layers\' core attention: TE\'s DotProductAttention '
+                            '(its backends: FA3, cuDNN...), or FlashAttention-4 directly (Blackwell: '
+                            'TE disables its cuDNN and FA4 backends under --softcap-attn).')
+    group.add_argument('--scalable-softmax', action='store_true')
+    # (todo, p-state-passing, not implemented yet)
+    group.add_argument('--intra-doc-masking', action='store_true')
+    group.add_argument('--training-sequence-length', type=int, default=2048)
+    group.add_argument('--slw-warmup-steps', type=int, default=0)
+    group.add_argument('--slw-warmup-offset', type=int, default=0,
+                       help='Training iteration at which the sliding-window warmup starts. '
+                       'Before this iter, the window stays at --slw-start; the linear ramp '
+                       'to --slw-end then runs from this iter for --slw-warmup-steps iters. '
+                       'Useful when resuming a job (e.g. annealing) where the window should '
+                       'ramp during a sub-phase rather than from iter 0. Default 0 preserves '
+                       'the legacy behavior.')
+    group.add_argument('--slw-start', type=int, default=0)
+    group.add_argument('--slw-end', type=int, default=0)
+    group.add_argument('--slw-increment', type=int, default=0)
+    group.add_argument('--artificial-seq-len', type=int, default=0)
+    group.add_argument('--quack-chunked-lce', action='store_true',
+                       help='LM loss via QuACK chunked linear cross entropy: the head runs sequence-parallel '
+                       'against the TP-gathered output weight and never materializes the logits.')
+    group.add_argument('--quack-lce-chunk-size', type=int, default=4096)
+    group.add_argument('--moe-router-type', type=str, default="classic")
+    group.add_argument("--no-mixer-gn", dest="mixer_gn", action="store_false")
+    group.add_argument('--reset-training', action='store_true')
+    group.add_argument('--moe-routed-input-dim', type=int, default=None)
+    group.add_argument('--use-lns', action='store_true')
+    # uscaling
+    group.add_argument('--use-uscaling', action='store_true')
+    group.add_argument('--uscaling-tau', type=float, default=0.2)
+    group.add_argument('--lr-mult-emb', type=float, default=0.1)
+    group.add_argument('--lr-mult-scalar', type=float, default=0.1)
+    group.add_argument('--lr-mult-head', type=float, default=0.1)
+    # completedp
+    group.add_argument('--use-completedp', action='store_true')
+    group.add_argument('--completedp-alpha', type=float, default=0.5)
+    group.add_argument('--completedp-train-iters', type=int, default=None,
+                       help='Training horizon T used by CompleteDP for the LR / WD / eps multipliers '
+                       '(through train_iters_base / T). Defaults to --train-iters. Set it to the original '
+                       'run\'s value when continuing a checkpoint with a short phase (context extension, SFT): '
+                       'with T = a few thousand iterations the LR multipliers grow ~sqrt(T0 / T).')
+    group.add_argument('--init-method-output-std', type=float, default=None)
+    group.add_argument('--init-method-embedding-std', type=float, default=None)
+    group.add_argument('--normalize-embeddings', action='store_true',
+                       help='Normalize embedding output and scale by sqrt(hidden_size).')
+    group.add_argument('--normalize-lm-head', action='store_true',
+                       help='Use cosine similarity with learned temperature for output logits.')
+    group.add_argument('--lr-emb', type=float, default=0.01)
+    group.add_argument('--lr-scalar', type=float, default=0.01)
+    group.add_argument('--lr-head', type=float, default=0.01)
+    group.add_argument('--lr-expert', type=float, default=None)
+    group.add_argument('--train-iters-base', type=int, default=None)
+    group.add_argument('--hidden-size-base', type=int, default=None)
+    group.add_argument('--layers-mixer-config-base', type=str, default=None)
+    group.add_argument('--use-ddl', action='store_true')
+    group.add_argument('--use-geodesic-norm', action='store_true')
+
+    # MoE router: PID controller for the expert bias (TransformerConfig fields)
+    group.add_argument('--moe-router-bias-use-pid', action='store_true',
+                       help='Use a PID controller instead of the sign-based step for expert bias updates. '
+                       'Provides smoother convergence to load balance equilibrium.')
+    group.add_argument('--moe-router-bias-pid-kp', type=float, default=1e-3,
+                       help='Proportional gain (Kp) for the PID expert bias controller.')
+    group.add_argument('--moe-router-bias-pid-ki', type=float, default=1e-4,
+                       help='Integral gain (Ki) for the PID expert bias controller.')
+    group.add_argument('--moe-router-bias-pid-kd', type=float, default=1e-4,
+                       help='Derivative gain (Kd) for the PID expert bias controller.')
+    # Mamba-3 MIMO
+    group.add_argument('--mamba-mimo-dim', type=int, default=4)
+    group.add_argument('--mamba-mimo-proj-block-order', type=int, default=1)
+    # FP8 on the MLP/MoE only
+    group.add_argument('--fp8-mlp-only', action='store_true',
+                       help='Apply FP8 precision only to the MLP/MoE portion of each layer, '
+                            'keeping the mixer (Mamba/Attention) in BF16. Requires --fp8-format.')
+    # Logging
+    group.add_argument('--log-grad-norm-per-param', action='store_true',
+                       help='If set, calculate and log the L2 gradient norm for each '
+                       'parameter individually to wandb (under grad-norm-per-param/ prefix). '
+                       'Useful for debugging training instabilities. '
+                       'Only computed at log intervals.')
+    group.add_argument('--wandb-fork-from-id', type=str, default=None, help='id of the wandb run to fork from.')
+    group.add_argument('--wandb-fork-from-step', type=int, default=None, help='step to fork from.')
+    # The legacy tokenizer system was removed upstream (v0.20); kept as a no-op so that existing
+    # launch scripts (--legacy-tokenizer --tokenizer-type SFTTokenizer) still parse.
+    group.add_argument('--legacy-tokenizer', action='store_true', default=False,
+                       help='[Dragon compat, no-op] the legacy tokenizer system no longer exists.')
+
+    group.add_argument = _add
+    return parser
 
 def _parse_triton_autotune_block_size(value):
     """Parse a named Triton block-size override for the nested policy."""
@@ -2719,6 +2859,14 @@ def _add_regularization_args(parser):
     group.add_argument('--adam-beta2', type=float, default=0.999,
                        help='Second coefficient for computing running averages '
                        'of gradient and its square')
+    group.add_argument('--ademamix-beta3', type=float, default=0.9999,
+                       help='Coefficient for computing slow first moment')
+    group.add_argument('--ademamix-alpha', type=float, default=8.0,
+                       help='Scaling factor for the slow term')
+    group.add_argument('--ademamix-beta3-warmup-steps', type=int, default=None,
+                       help='Number of warmup steps for beta3')
+    group.add_argument('--ademamix-alpha-warmup-steps', type=int, default=None,
+                       help='Number of warmup steps for alpha')
     group.add_argument('--adam-eps', type=float, default=1e-08,
                        help='Term added to the denominator to improve'
                        'numerical stability')
@@ -2876,7 +3024,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon', 'ademamix'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
@@ -3327,6 +3475,12 @@ def _add_data_args(parser):
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
+    group.add_argument('--create-cu-seqlens-in-dataloader', action='store_true', default=True,
+                       help='Create cu_seqlens in dataloader (default ON). '
+                            'Disable with --no-create-cu-seqlens-in-dataloader.')
+    group.add_argument('--no-create-cu-seqlens-in-dataloader', action='store_false',
+                       dest='create_cu_seqlens_in_dataloader',
+                       help='Disable cu_seqlens creation in the dataloader.')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--object-storage-cache-path', type=str, default=None,

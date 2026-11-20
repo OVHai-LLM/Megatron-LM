@@ -44,7 +44,7 @@ from megatron.training import (
 from megatron.training.argument_utils import _triton_autotune_config_from_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
-from megatron.training.global_vars import get_run_config
+from megatron.training.global_vars import get_run_config, set_wandb_writer
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +206,10 @@ def initialize_megatron(
 
         # No continuation function
         return None
+    
+
+def initialize_wandb(args):
+    set_wandb_writer(args)
 
 
 def _compile_dependencies():

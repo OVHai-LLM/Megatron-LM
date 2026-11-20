@@ -733,6 +733,7 @@ class TokenizerConfig:
         "SentencePieceTokenizer",
         "GPTSentencePieceTokenizer",
         "HuggingFaceTokenizer",
+        "HuggingFacePretrainedTokenizer",
         "Llama2Tokenizer",
         "TikTokenizer",
         "MultimodalTokenizer",

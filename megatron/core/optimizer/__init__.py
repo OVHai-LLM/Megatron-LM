@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
+import math
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
@@ -35,6 +36,21 @@ except ImportError:
         USING_PYTORCH_OPTIMIZER = True
 
 try:
+    # Dragon: AdEMAMix from the OVHai TransformerEngine fork.
+    from transformer_engine.pytorch.optimizers import FusedAdemamix as Ademamix
+except ImportError:
+    Ademamix = None
+
+try:
+    import transformer_engine as te
+
+    # Dragon's uscaling / CompleteDP param groups walk TE linear modules (TE fork: row_parallel).
+    _TE_LINEAR_TYPES = (te.pytorch.Linear, te.pytorch.LayerNormLinear, te.pytorch.GroupedLinear)
+except ImportError:
+    te = None
+    _TE_LINEAR_TYPES = ()
+
+try:
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _pkg_version
 
@@ -47,6 +63,7 @@ HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
 
+from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
     ParamGroupOverride,
@@ -302,6 +319,452 @@ def get_mup_config_overrides(
     return mup_overrides
 
 
+def _get_param_groups_uscaling(
+    model_chunks: List[MegatronModule],
+    base_lr: float,
+    lr_mult_emb: float,
+    lr_mult_scalar: float,
+    lr_mult_head: float,
+    min_lr: Optional[float] = None,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> List[Dict]:
+    """Dragon u-muP ("uscaling") param groups: per-tensor lr_mult from fan-in, truly decoupled WD."""
+
+    # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
+    params_map = {}
+    for model_chunk in model_chunks:
+        seen = set()
+        for name, mod in model_chunk.named_modules():
+            if isinstance(mod, _TE_LINEAR_TYPES):
+                assert hasattr(mod, "row_parallel")
+                size_mult = 1
+                if mod.row_parallel:
+                    if not isinstance(mod, te.pytorch.GroupedLinear):
+                        size_mult = parallel_state.get_tensor_model_parallel_world_size()
+                    else:
+                        size_mult = parallel_state.get_expert_tensor_parallel_world_size()
+
+                if isinstance(mod, te.pytorch.GroupedLinear):
+                    is_grouped = True
+                    num_weights = mod.num_gemms
+                else:
+                    is_grouped = False
+                    num_weights = 1
+
+                for w_idx in range(num_weights if num_weights > 0 else 1):
+                    weight_attr = "weight" if not is_grouped else f"weight{w_idx}"
+                    weight = getattr(mod, weight_attr)
+
+                    if not weight.requires_grad:
+                        continue           
+
+                    is_expert_parallel = not (getattr(mod, 'allreduce', True) and getattr(weight, 'allreduce', True))
+                    is_decoupled_lr = False
+                    is_scalar = getattr(mod, "is_scalar_weight", False)
+
+                    # compute wd_mult, lr_mult
+                    if "output_layer" in name:
+                        _lr_mult = lr_mult_head
+                        _wd_mult = 0.
+                    elif is_scalar:
+                        _lr_mult = lr_mult_scalar
+                        _wd_mult = 0.
+                    else: # hidden matrix weight
+                        fan_in = size_mult * weight.shape[1]
+                        _lr_mult = 1 / math.sqrt(fan_in)
+                        _wd_mult = 1.
+                    _wd_mult = _wd_mult / (base_lr * _lr_mult) # truly decoupled weight decay
+
+                    if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+                        print(f"param {name}.{weight_attr} | shape {weight.shape} (multiplied: {size_mult}) | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e} | is_expert_parallel={is_expert_parallel}")
+
+                    key = (_wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+                    if key not in params_map:
+                        params_map[key] = []
+                    params_map[key].append(weight)
+                    seen.add(weight)
+
+                    bias_attr = "bias" if num_weights == 1 else f"bias{w_idx}"
+                    bias = getattr(mod, bias_attr, None)
+                    if bias is not None and bias.requires_grad:
+                        is_expert_parallel = not getattr(bias, 'allreduce', True)
+                        is_decoupled_lr = False
+                        _lr_mult = lr_mult_scalar
+                        _wd_mult = 0.
+
+                        _wd_mult = _wd_mult / (base_lr * _lr_mult) # truly decoupled weight decay
+
+                        key = (_wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+                        if key not in params_map:
+                            params_map[key] = []
+                        params_map[key].append(bias)
+                        seen.add(bias)
+
+                        #if parallel_state.get_data_parallel_rank() == 0:
+                        #    print(f"param {name}.{bias_attr} | shape {mod.bias.shape} | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e}")
+
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param in seen:
+                continue
+
+            is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_decoupled_lr = False
+
+            # compute wd_mult, lr_mult
+            if "embedding" in name:
+                _lr_mult = lr_mult_emb
+                _wd_mult = 0.
+            elif "router.weight" in name:
+                fan_in = size_mult * param.shape[1]
+                _lr_mult = 1 / math.sqrt(fan_in)
+                _wd_mult = 1.
+            else:
+                _lr_mult = lr_mult_scalar
+                _wd_mult = 0.
+            
+            if getattr(param, 'requires_weight_decay', False):
+                _wd_mult = 1.0
+
+            _wd_mult = _wd_mult / (base_lr * _lr_mult) # truly decoupled weight decay
+
+            key = (_wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+            if key not in params_map:
+                params_map[key] = []
+            params_map[key].append(param)
+
+            if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+                print(f"param {name} | shape {param.shape} | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e} | is_expert_parallel={is_expert_parallel}")
+    
+    # Distributed checkpoint requires all ranks to have the same param groups,
+    # so we need to align the param groups across ranks, otherwise we may have
+    # runtime error when loading the checkpoint or numerical error when resuming training.
+    params_key = list(params_map.keys())
+    gathered_params_key = [None] * torch.distributed.get_world_size(group=process_group)
+    torch.distributed.all_gather_object(gathered_params_key, params_key, group=process_group)
+    for keys in gathered_params_key:
+        for key in keys:
+            if key not in params_key:
+                params_key.append(key)
+
+    param_groups = []
+    for key in params_key:
+        wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr = key
+        params = params_map[key] if key in params_map else []
+        param_group = {
+            'params': params,
+            'wd_mult': wd_mult,
+            'lr_mult': _lr_mult,
+            'is_expert_parallel': is_expert_parallel,
+            'is_decoupled_lr': is_decoupled_lr,
+            # upstream keys: the scheduler reads max_lr / min_lr per group; lr = sched * lr_mult
+            'default_config': True,
+            'max_lr': base_lr,
+            'min_lr': min_lr,
+        }
+        param_groups.append(param_group)
+
+    return param_groups
+
+
+def _get_param_groups_completedp(
+    model_chunks: List[MegatronModule],
+    base_lr_hidden: float,
+    base_lr_emb: float,
+    base_lr_scalar: float,
+    base_lr_head: float,
+    base_lr_expert: float,
+    base_wd_hidden: float,
+    base_eps: float,
+    alpha_completedp: float,
+    rho_adjusted: float,
+    width_adjusted: float,
+    depth_adjusted: float,
+    min_lr: float = None,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> List[Dict]:
+    """Dragon CompleteDP param groups: per-tensor LR / WD / Adam-eps multipliers from the width,
+    depth and horizon ratios to the base run (lr_mult = lr / base_lr_hidden, wd_mult = wd /
+    base_wd_hidden; the scheduler multiplies its LR by lr_mult)."""
+
+    MAX_NAME  = 90   # tweak
+    MAX_SHAPE = 14   # tweak
+
+    def _clip(s: str, w: int) -> str:
+        return s if len(s) <= w else (s[:w-3] + "...")
+    def _shape_str(shape) -> str:
+        return "x".join(map(str, shape))
+
+    # Map (wd_mult, lr_mult, eps, is_expert_parallel, is_decoupled_lr) to params.
+    params_map = {}
+    for model_chunk in model_chunks:
+        seen = set()
+        for name, mod in model_chunk.named_modules():
+            if isinstance(mod, _TE_LINEAR_TYPES):
+                assert hasattr(mod, "row_parallel")
+
+                if isinstance(mod, te.pytorch.GroupedLinear):
+                    is_grouped = True
+                    num_weights = mod.num_gemms
+                else:
+                    is_grouped = False
+                    num_weights = 1
+
+                for w_idx in range(num_weights if num_weights > 0 else 1):
+                    weight_attr = "weight" if not is_grouped else f"weight{w_idx}"
+                    weight = getattr(mod, weight_attr)
+
+                    if not weight.requires_grad:
+                        continue           
+
+                    is_expert_parallel = not (getattr(mod, 'allreduce', True) and getattr(weight, 'allreduce', True))
+                    is_decoupled_lr = False
+
+                    # compute wd_mult, lr_mult
+                    if "output_layer" in name:
+                        base_lr = base_lr_head
+                        scale_lr = (width_adjusted ** (-1)) * rho_adjusted
+                        lr = base_lr * scale_lr
+
+                        base_wd = base_wd_hidden # TODO: wd or not ?
+                        scale_wd = width_adjusted * rho_adjusted
+                        wd = base_wd * scale_wd
+
+                        base_eps = base_eps
+                        scale_eps = 1/rho_adjusted
+                        eps = base_eps * scale_eps
+                    else: # hidden matrix weight
+                        base_lr = base_lr_hidden
+                        if "experts.linear_fc" in name and "shared" not in name:
+                            base_lr = base_lr_expert
+                        scale_lr = (width_adjusted ** (-1)) * (depth_adjusted ** (alpha_completedp-1)) * rho_adjusted
+                        lr = base_lr * scale_lr
+
+                        base_wd = base_wd_hidden
+                        scale_wd = (width_adjusted) * rho_adjusted
+                        wd = base_wd * scale_wd
+
+                        base_eps = base_eps
+                        scale_eps = ((width_adjusted) ** (-1)) * (depth_adjusted ** (-alpha_completedp)) * 1/rho_adjusted
+                        eps = base_eps * scale_eps
+
+                    if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+                        if not "mlp.experts.linear" in name:
+                            print(
+                                f"param {_clip(name, MAX_NAME):<{MAX_NAME}}"
+                                f" | shape {_shape_str(weight.shape):>{MAX_SHAPE}}"
+                                f" | lr={lr:9.3e} | wd={wd:9.3e} | eps={eps:9.3e}"
+                                f" | is_expert_parallel={is_expert_parallel}"
+                            )
+
+                    key = (wd/base_wd_hidden, lr/base_lr_hidden, eps, is_expert_parallel, is_decoupled_lr)
+                    if key not in params_map:
+                        params_map[key] = []
+                    params_map[key].append(weight)
+                    seen.add(weight)
+
+                    bias_attr = "bias" if num_weights == 1 else f"bias{w_idx}"
+                    bias = getattr(mod, bias_attr, None)
+                    if bias is not None and bias.requires_grad:
+                        is_expert_parallel = not getattr(bias, 'allreduce', True)
+                        is_decoupled_lr = False
+
+                        base_lr = base_lr_scalar
+                        scale_lr = (depth_adjusted ** (alpha_completedp-1)) * rho_adjusted
+                        lr = base_lr * scale_lr
+
+                        wd = 0.
+
+                        base_eps = base_eps
+                        if "output_layer" in name:
+                            scale_eps = 1/rho_adjusted
+                        else:
+                            scale_eps = ((width_adjusted) ** (-1)) * (depth_adjusted ** (-alpha_completedp)) * 1/rho_adjusted
+                        eps = base_eps * scale_eps
+
+                        key = (wd/base_wd_hidden, lr/base_lr_hidden, eps, is_expert_parallel, is_decoupled_lr)
+                        if key not in params_map:
+                            params_map[key] = []
+                        params_map[key].append(bias)
+                        seen.add(bias)
+
+                        if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+                            print(
+                                f"param {_clip(name, MAX_NAME):<{MAX_NAME}}"
+                                f" | shape {_shape_str(bias.shape):>{MAX_SHAPE}}"
+                                f" | lr={lr:9.3e} | wd={wd:9.3e} | eps={eps:9.3e}"
+                                f" | is_expert_parallel={is_expert_parallel}"
+                            )
+
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param in seen:
+                continue
+
+            is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_decoupled_lr = False
+
+            # compute wd_mult, lr_mult
+            if "embedding" in name:
+                base_lr = base_lr_emb
+                scale_lr = rho_adjusted
+                lr = base_lr * scale_lr
+
+                base_wd = 0.
+                scale_wd = rho_adjusted
+                wd = base_wd * scale_wd
+
+                base_eps = base_eps
+                scale_eps = ((width_adjusted) ** (-1)) * 1/rho_adjusted
+                eps = base_eps * scale_eps
+            elif "final_layernorm" in name:
+                base_lr = base_lr_scalar
+                scale_lr = rho_adjusted
+                lr = base_lr * scale_lr
+
+                base_wd = 0.
+                scale_wd = rho_adjusted
+                wd = base_wd * scale_wd
+
+                base_eps = base_eps
+                scale_eps = 1/rho_adjusted
+                eps = base_eps * scale_eps
+            elif "router.weight" in name: # TODO: for the router, same base lr as hidden? same WD? it has a finite second dimension
+                base_lr = base_lr_hidden
+                scale_lr = (width_adjusted ** (-1)) * (depth_adjusted ** (alpha_completedp-1)) * rho_adjusted
+                lr = base_lr * scale_lr
+
+                base_wd = base_wd_hidden
+                scale_wd = (width_adjusted) * rho_adjusted
+                wd = base_wd * scale_wd
+
+                base_eps = base_eps
+                scale_eps = ((width_adjusted) ** (-1)) * (depth_adjusted ** (-alpha_completedp)) * 1/rho_adjusted
+                eps = base_eps * scale_eps
+            else:
+                base_lr = base_lr_scalar
+                scale_lr = (depth_adjusted ** (alpha_completedp-1)) * rho_adjusted
+                lr = base_lr * scale_lr
+
+                base_wd = 0.
+                scale_wd = rho_adjusted
+                wd = base_wd * scale_wd
+
+                base_eps = base_eps
+                if not("q_layernorm" in name or "k_layernorm" in name):
+                    scale_eps = (width_adjusted ** (-1)) * (depth_adjusted ** (-alpha_completedp)) * 1/rho_adjusted
+                else:
+                    scale_eps = (depth_adjusted ** (-alpha_completedp)) * 1/rho_adjusted
+                eps = base_eps * scale_eps
+
+            assert not getattr(param, 'requires_weight_decay', False)
+
+            key = (wd/base_wd_hidden, lr/base_lr_hidden, eps, is_expert_parallel, is_decoupled_lr)
+            if key not in params_map:
+                params_map[key] = []
+            params_map[key].append(param)
+
+            if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+                print(
+                    f"param {_clip(name, MAX_NAME):<{MAX_NAME}}"
+                    f" | shape {_shape_str(param.shape):>{MAX_SHAPE}}"
+                    f" | lr={lr:9.3e} | wd={wd:9.3e} | eps={eps:9.3e}"
+                    f" | is_expert_parallel={is_expert_parallel}"
+                )
+
+    # Distributed checkpoint requires all ranks to have the same param groups,
+    # so we need to align the param groups across ranks, otherwise we may have
+    # runtime error when loading the checkpoint or numerical error when resuming training.
+    params_key = list(params_map.keys())
+    gathered_params_key = [None] * torch.distributed.get_world_size(group=process_group)
+    torch.distributed.all_gather_object(gathered_params_key, params_key, group=process_group)
+    for keys in gathered_params_key:
+        for key in keys:
+            if key not in params_key:
+                params_key.append(key)
+
+    param_groups = []
+    for key in params_key:
+        wd_mult, _lr_mult, eps, is_expert_parallel, is_decoupled_lr = key
+        params = params_map[key] if key in params_map else []
+        param_group = {
+            'params': params,
+            'wd_mult': wd_mult,
+            'lr_mult': _lr_mult,
+            'eps': eps,
+            'is_expert_parallel': is_expert_parallel,
+            'is_decoupled_lr': is_decoupled_lr,
+            # upstream keys: the scheduler reads max_lr / min_lr per group; lr = sched * lr_mult
+            'default_config': True,
+            'max_lr': base_lr_hidden,
+        }
+        if min_lr is not None:
+            param_group['min_lr'] = min_lr
+        param_groups.append(param_group)
+
+    return param_groups
+
+
+def _get_dragon_legacy_config_overrides(
+    config: OptimizerConfig,
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    no_weight_decay_cond: Optional[Callable],
+    scale_lr_cond: Optional[Callable],
+    lr_mult: float,
+    default_skip_embedding_weight_decay: bool,
+) -> Optional[Dict[ParamKey, ParamGroupOverride]]:
+    """Translate the pre-0.16 (no_weight_decay_cond, scale_lr_cond, lr_mult,
+    default_skip_embedding_weight_decay) arguments Dragon's training.py still passes into upstream
+    ParamKey config overrides. Returns config_overrides unchanged when none of them is set."""
+    if (
+        no_weight_decay_cond is None
+        and scale_lr_cond is None
+        and not default_skip_embedding_weight_decay
+    ):
+        return config_overrides
+    overrides = dict(config_overrides) if config_overrides is not None else None
+    if no_weight_decay_cond is not None:
+        # The condition replaces the default "bias / 1-D" no-WD rule (pre-0.16 semantics).
+        overrides = {
+            k: v
+            for k, v in (overrides or get_standard_config_overrides(config)).items()
+            if set(v.keys()) != {'wd_mult'}
+        }
+        overrides[
+            ParamKey(
+                with_name_predicate=ParamWithNamePredicate(
+                    name="dragon_no_weight_decay_cond",
+                    fn=lambda param, name: bool(no_weight_decay_cond(name, param)),
+                )
+            )
+        ] = ParamGroupOverride(wd_mult=0.0)
+    elif default_skip_embedding_weight_decay:
+        overrides = overrides if overrides is not None else get_standard_config_overrides(config)
+        overrides[
+            ParamKey(
+                with_name_predicate=ParamWithNamePredicate(
+                    name="dragon_skip_embedding_wd", fn=lambda param, name: "embedding" in name
+                )
+            )
+        ] = ParamGroupOverride(wd_mult=0.0)
+    if scale_lr_cond is not None and lr_mult != 1.0:
+        overrides = overrides if overrides is not None else get_standard_config_overrides(config)
+        scaled: ParamGroupOverride = {"max_lr": config.lr * lr_mult}
+        if config.min_lr is not None:
+            scaled["min_lr"] = config.min_lr * lr_mult
+        overrides[
+            ParamKey(
+                with_name_predicate=ParamWithNamePredicate(
+                    name="dragon_scale_lr_cond",
+                    fn=lambda param, name: bool(scale_lr_cond(name, param)),
+                )
+            )
+        ] = scaled
+    return overrides
+
+
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
@@ -429,6 +892,12 @@ def _get_param_groups_and_buffers(
     filter_fn: Callable,
     buffer_name: str,
     process_group: Optional[torch.distributed.ProcessGroup] = None,
+    uscaling: bool = False,
+    completedp: bool = False,
+    alpha_completedp: Optional[float] = None,
+    rho_adjusted: Optional[float] = None,
+    width_adjusted: Optional[float] = None,
+    depth_adjusted: Optional[float] = None,
 ) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
     """Returns parameter groups and buffer for optimizer.
 
@@ -449,7 +918,41 @@ def _get_param_groups_and_buffers(
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
-    param_groups = _get_param_groups(model_chunks, config, config_overrides, process_group)
+    if uscaling:
+        assert config.lr_mult_emb is not None
+        assert config.lr_mult_scalar is not None
+        assert config.lr_mult_head is not None
+        param_groups = _get_param_groups_uscaling(
+            model_chunks,
+            base_lr=config.lr,
+            lr_mult_emb=config.lr_mult_emb,
+            lr_mult_scalar=config.lr_mult_scalar,
+            lr_mult_head=config.lr_mult_head,
+            min_lr=config.min_lr,
+            process_group=process_group,
+        )
+    elif completedp:
+        assert config.lr_emb is not None
+        assert config.lr_scalar is not None
+        assert config.lr_head is not None
+        param_groups = _get_param_groups_completedp(
+            model_chunks,
+            base_lr_hidden=config.lr,
+            base_lr_emb=config.lr_emb,
+            base_lr_scalar=config.lr_scalar,
+            base_lr_head=config.lr_head,
+            base_lr_expert=config.lr_expert if config.lr_expert is not None else config.lr,
+            base_wd_hidden=config.weight_decay,
+            base_eps=config.adam_eps,
+            alpha_completedp=alpha_completedp,
+            rho_adjusted=rho_adjusted,
+            width_adjusted=width_adjusted,
+            depth_adjusted=depth_adjusted,
+            min_lr=config.min_lr,
+            process_group=process_group,
+        )
+    else:
+        param_groups = _get_param_groups(model_chunks, config, config_overrides, process_group)
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
@@ -512,6 +1015,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     # for the purposes of grad stats reductions.
     if param_groups:
         if config.optimizer_cpu_offload:
+            assert config.optimizer != 'ademamix', "AdEMAMix does not support optimizer CPU offload"
             if torch.__version__ < '2.3.0':
                 warnings.warn(
                     "CPU offload is recommended for PyTorch >= 2.3.0, "
@@ -605,6 +1109,56 @@ def _get_megatron_optimizer_based_on_param_groups(
                         if len(opt.state[p]) == 0:
                             if config is None or not config.use_precision_aware_optimizer:
                                 opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                                opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                            else:
+                                opt.initialize_state(p)
+
+        elif config.optimizer == 'ademamix':
+            # Dragon: TE fork's FusedAdemamix (betas = (beta1, beta2, beta3), alpha; the
+            # scheduler warms up beta3 / alpha every step).
+            if Ademamix is None:
+                raise ImportError(
+                    "--optimizer ademamix needs the OVHai TransformerEngine fork (FusedAdemamix)."
+                )
+            kwargs = {
+                "params": param_groups,
+                "lr": config.lr,
+                "weight_decay": config.weight_decay,
+                "betas": (config.adam_beta1, config.adam_beta2, config.ademamix_beta3),
+                "alpha": config.ademamix_alpha,
+                "eps": config.adam_eps,
+            }
+
+            if config.use_precision_aware_optimizer:
+                kwargs.update(
+                    {
+                        "exp_avg_dtype": config.exp_avg_dtype,
+                        "exp_avg_sq_dtype": config.exp_avg_sq_dtype,
+                    }
+                )
+                if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and not isinstance(
+                    model_chunks[0], FullyShardedDataParallelV2
+                ):
+                    kwargs.update(
+                        {
+                            "master_weights": True,
+                            "use_decoupled_grad": True,
+                            "master_weight_dtype": config.main_params_dtype,
+                        }
+                    )
+
+                if is_te_min_version("2.1.0.dev0"):
+                    kwargs.update({"store_param_remainders": config.store_param_remainders})
+
+            optimizer = Ademamix(**kwargs)
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            if config is None or not config.use_precision_aware_optimizer:
+                                opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                                opt.state[p]['exp_avg_slow'] = torch.zeros_like(p.data)
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
                                 opt.initialize_state(p)
@@ -1037,11 +1591,22 @@ def _clear_high_precision_initializers(model_chunks: List[MegatronModule]) -> No
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
+    uscaling: bool = False,
+    completedp: bool = False,
+    alpha_completedp: Optional[float] = None,
+    rho_adjusted: Optional[float] = None,
+    width_adjusted: Optional[float] = None,
+    depth_adjusted: Optional[float] = None,
+    no_weight_decay_cond: Optional[Callable] = None,
+    scale_lr_cond: Optional[Callable] = None,
+    lr_mult: float = 1.0,
+    *,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
     use_gloo_process_groups: bool = True,
     pg_collection: Optional[ProcessGroupCollection] = None,
     dump_param_to_param_group_map: Optional[str] = None,
     param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
+    default_skip_embedding_weight_decay: bool = False,
 ) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
@@ -1063,9 +1628,24 @@ def get_megatron_optimizer(
         param_group_process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks
             must construct aligned optimizer parameter groups. ``None`` preserves WORLD alignment.
 
+    Dragon arguments (positional, in the order Dragon's training.py passes them):
+        uscaling / completedp: build Dragon's u-muP or CompleteDP param groups instead of the
+            config_overrides ones (alpha_completedp, rho_adjusted, width_adjusted and
+            depth_adjusted parametrize CompleteDP).
+        no_weight_decay_cond, scale_lr_cond, lr_mult, default_skip_embedding_weight_decay:
+            pre-0.16 API, translated into config_overrides.
+
     Returns:
         Instance of MegatronOptimizer.
     """
+    dragon_groups_kwargs = dict(
+        uscaling=uscaling,
+        completedp=completedp,
+        alpha_completedp=alpha_completedp,
+        rho_adjusted=rho_adjusted,
+        width_adjusted=width_adjusted,
+        depth_adjusted=depth_adjusted,
+    )
 
     # A MimoModel routes to the heterogeneous per-module optimizer builder.
     from megatron.core.models.mimo.model.base import MimoModel
@@ -1080,6 +1660,14 @@ def get_megatron_optimizer(
 
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
+    config_overrides = _get_dragon_legacy_config_overrides(
+        config,
+        config_overrides,
+        no_weight_decay_cond,
+        scale_lr_cond,
+        lr_mult,
+        default_skip_embedding_weight_decay,
+    )
     if config_overrides is None:
         config_overrides = get_standard_config_overrides(config)
 
@@ -1088,7 +1676,8 @@ def get_megatron_optimizer(
     is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    if config.optimizer not in ('adam', 'sgd', 'ademamix'):
+        assert not (uscaling or completedp), "Dragon uscaling / CompleteDP need adam or ademamix"
         optimizer = _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
@@ -1188,6 +1777,7 @@ def get_megatron_optimizer(
                     filter_fn=lambda g: True,
                     buffer_name='buffers',
                     process_group=param_group_process_group,
+                    **dragon_groups_kwargs,
                 )
 
             optimizer_part = _get_megatron_optimizer_based_on_param_groups(
@@ -1241,6 +1831,7 @@ def get_megatron_optimizer(
             filter_fn=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
             process_group=param_group_process_group,
+            **dragon_groups_kwargs,
         )
         for model_chunk in dense_model_chunks:
             model_chunk.overlap_param_gather_with_optimizer_step = (
@@ -1279,6 +1870,7 @@ def get_megatron_optimizer(
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
         process_group=param_group_process_group,
+        **dragon_groups_kwargs,
     )
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:

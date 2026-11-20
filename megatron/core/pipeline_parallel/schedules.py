@@ -6,6 +6,7 @@ from itertools import chain
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
+import torch.distributed as dist
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
@@ -861,6 +862,21 @@ def forward_backward_no_pipelining(
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
             del output_tensor
 
+    def _dump_missing_grads(models):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        for mi, m in enumerate(models):
+            missing = []
+            for name, p in m.named_parameters():
+                if p.requires_grad and p.grad is None:
+                    missing.append(name)
+            if missing:
+                print(f"[rank {rank}] missing grads (model {mi}): {len(missing)}")
+                for n in missing[:200]:
+                    print(f"missing - {n}")
+
+    # ... in forward_backward_no_pipelining(), right before finalize:
+    #_dump_missing_grads([model] if not isinstance(model, (list, tuple)) else model)
+    
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
@@ -2122,6 +2138,9 @@ def _get_pipeline_hidden_size(config) -> int:
     the last physical rank sending to the next virtual chunk on the first rank.
     """
     hidden_size = config.hidden_size
+    if getattr(config, "use_ddl", False):
+        # Dragon DDL: the residual stream is expanded by ddl_expand_factor
+        hidden_size *= config.ddl_expand_factor
     if config.pipeline_model_parallel_size > 1 and getattr(config, "enable_mhc_connections", False):
         hidden_size *= config.mhc_num_residual_streams
     return hidden_size

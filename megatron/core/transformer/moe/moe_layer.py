@@ -248,10 +248,13 @@ class MoELayer(BaseMoELayer):
         is_mtp_layer: bool = False,
         hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
+        input_scalar: float = 1.0,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            input_scalar (float): Dragon's layer input scalar (lns), folded into the router GEMM,
+                the latent down projection and the shared experts' fc1 (alpha GEMMs).
         """
         self.submodules = not_none(submodules)
         # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -278,11 +281,13 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
+        router_kwargs = {"input_scalar": input_scalar} if input_scalar != 1.0 else {}
         self.router = self.submodules.router(
             config=self.config,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
             hash_moe_layer_threshold=hash_moe_layer_threshold,
+            **router_kwargs,
         )
         if layer_number is not None:
             self.router.set_layer_number(layer_number)
@@ -346,6 +351,45 @@ class MoELayer(BaseMoELayer):
                 self.fc1_latent_proj._tp_group = pg_collection.tp
                 self.fc2_latent_proj._tp_group = pg_collection.tp
 
+        # Dragon latent MoE (--moe-routed-input-dim): routed experts run in a compressed
+        # dimension between down_proj / up_proj (checkpoint names kept). Unlike upstream's
+        # moe_latent_size, the shared experts stay on the full hidden size.
+        self.dragon_latent = bool(getattr(self.config, "moe_routed_input_dim", None))
+        if self.dragon_latent:
+            assert not self.config.moe_latent_size, "moe_routed_input_dim and moe_latent_size"
+            assert HAVE_TE, "TransformerEngine is required for Dragon's latent MoE."
+            self.down_proj = TELinear(
+                self.config.hidden_size,
+                self.config.moe_routed_input_dim,
+                config=self.config,
+                parallel_mode="duplicated",
+                init_method=self.config.init_method,
+                bias=False,
+                alpha_fwd=input_scalar,
+                alpha_bwd=input_scalar,
+                skip_bias_add=True,
+                skip_weight_param_allocation=False,
+                tp_comm_buffer_name="down_proj",
+            )
+            self.up_proj = TELinear(
+                self.config.moe_routed_input_dim,
+                self.config.hidden_size,
+                config=self.config,
+                parallel_mode="duplicated",
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=True,
+                skip_weight_param_allocation=False,
+                tp_comm_buffer_name="up_proj",
+            )
+            self.down_proj._tp_group = pg_collection.tp
+            self.up_proj._tp_group = pg_collection.tp
+        # Dragon: shared-expert overlap with the latent MoE is staged from this layer's forward
+        # (the dispatcher only sees latent-dim tokens): FC1 || dispatch, FC2 || combine.
+        self.dragon_latent_overlap = (
+            self.dragon_latent and self.shared_expert_overlap and self.use_shared_expert
+        )
+
         # Megakernel backends replace native dispatch, expert compute, and combine,
         # so only construct a token dispatcher for the native MoE path.
         if config.moe_megakernel_backend is None:
@@ -394,6 +438,7 @@ class MoELayer(BaseMoELayer):
                     pg_collection=pg_collection,
                     gate=self.config.moe_shared_expert_gate,
                     name=(name + ".shared_experts") if name is not None else None,
+                    **({"input_scalar": input_scalar} if input_scalar != 1.0 else {}),
                 )
             else:
                 shared_expert_config = prepare_megakernel_shared_expert_config(self.config)
@@ -404,7 +449,7 @@ class MoELayer(BaseMoELayer):
                         gate=self.config.moe_shared_expert_gate,
                         name=(name + ".shared_experts") if name is not None else None,
                     )
-            if self.shared_expert_overlap:
+            if self.shared_expert_overlap and not self.dragon_latent_overlap:
                 assert self.token_dispatcher is not None
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
@@ -587,6 +632,11 @@ class MoELayer(BaseMoELayer):
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
+        if self.dragon_latent:
+            if self.dragon_latent_overlap:
+                # the shared expert starts on its side stream from the full-dimension input
+                self.shared_experts.pre_forward_comm(hidden_states)
+            hidden_states, _ = self.down_proj(hidden_states)
         if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
             # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
@@ -697,6 +747,13 @@ class MoELayer(BaseMoELayer):
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
+        if self.dragon_latent:
+            if self.dragon_latent_overlap:
+                # shared expert's reduce-scatter overlaps with up_proj
+                self.shared_experts.post_forward_comm()
+            output, _ = self.up_proj(output)
+            if self.dragon_latent_overlap:
+                output = output + self.shared_experts.get_output()
 
         if shared_expert_output is not None:
             output = output + shared_expert_output
@@ -809,10 +866,16 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
+                if self.dragon_latent_overlap:
+                    # shared expert FC1 overlaps with the dispatch all-to-all
+                    self.shared_experts.linear_fc1_forward_and_act()
                 output, mlp_bias = self.routed_experts_compute(*self.dispatch(hidden_states, probs))
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                if self.dragon_latent_overlap:
+                    # shared expert FC2 overlaps with the combine all-to-all
+                    self.shared_experts.linear_fc2_forward()
                 output = self.combine(output)
 
                 if intermediate_tensors is not None:

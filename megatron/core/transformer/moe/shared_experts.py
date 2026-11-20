@@ -114,6 +114,7 @@ class SharedExpertMLP(MLP):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         gate: bool,
+        input_scalar: float = 1.,
         pg_collection: Optional[ProcessGroupCollection] = None,
         name: str | None = None,
     ):
@@ -132,6 +133,7 @@ class SharedExpertMLP(MLP):
             tp_group=pg_collection.tp,
             name=name,
             pg_collection=pg_collection,
+            input_scalar=input_scalar,
         )
 
         self.use_shared_expert_gate = gate

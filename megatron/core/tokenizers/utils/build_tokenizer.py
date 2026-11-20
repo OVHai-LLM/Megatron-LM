@@ -11,6 +11,7 @@ SP_TOKENIZERS = ['SentencePieceTokenizer', 'GPTSentencePieceTokenizer', 'Llama2T
 
 SUPPORTED_TOKENIZERS = [
     'HuggingFaceTokenizer',
+    'HuggingFacePretrainedTokenizer',  # Dragon: alias of HuggingFaceTokenizer (tokenizer_config.json path)
     'TikTokenizer',
     'MultimodalTokenizer',
     'NullTokenizer',
@@ -65,7 +66,7 @@ def build_tokenizer(args, **kwargs):
             kwargs['vocab_size'] = args.vocab_size
         kwargs['num_special_tokens'] = args.tiktoken_num_special_tokens
         kwargs['special_tokens'] = args.special_tokens
-    elif args.tokenizer_type == 'HuggingFaceTokenizer':
+    elif args.tokenizer_type in ('HuggingFaceTokenizer', 'HuggingFacePretrainedTokenizer'):
         tokenizer_library = 'huggingface'
         tokenizer_path = args.tokenizer_model
         kwargs['chat_template'] = args.chat_template

@@ -30,7 +30,12 @@ from megatron.core.transformer.moe.batch_invariant import unpermute as batch_inv
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecated, internal_api, is_te_min_version
+from megatron.core.utils import (
+    deprecated,
+    get_attr_wrapped_model,
+    internal_api,
+    is_te_min_version,
+)
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -933,6 +938,12 @@ def topk_routing_with_score_function(
             if precomputed_indices is not None:
                 top_indices = precomputed_indices
                 probs = torch.gather(scores, dim=1, index=top_indices)
+            elif expert_bias is not None:
+                # Dragon: aux-loss-free expert bias with pre-softmax routing
+                _, top_indices = compute_topk(
+                    scores + expert_bias.float(), topk, num_groups, group_topk
+                )
+                probs = torch.gather(scores, dim=1, index=top_indices)
             else:
                 probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
@@ -1218,13 +1229,24 @@ def track_moe_metrics(
     num_layers: Optional[int] = None,
     num_moe_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
+    num_first_mlp_layers: int = 0,
     mtp_num_layers: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> str:
     """Track the MoE metrics for logging.
 
     Deprecated: Use get_moe_metrics_tracker().report() directly.
+
+    Dragon: ``num_first_mlp_layers`` dense layers at the start of the model are not MoE layers.
     """
+    if num_first_mlp_layers and num_moe_layers is None and num_layers is not None:
+        if moe_layer_freq is None:
+            num_moe_layers = num_layers
+        elif isinstance(moe_layer_freq, int):
+            num_moe_layers = sum(1 for i in range(num_layers) if i % moe_layer_freq == 0)
+        else:
+            num_moe_layers = sum(moe_layer_freq)
+        num_moe_layers -= num_first_mlp_layers
     return get_moe_metrics_tracker().report(
         loss_scale=loss_scale,
         iteration=iteration,
@@ -1240,6 +1262,49 @@ def track_moe_metrics(
         pg_collection=pg_collection,
         total_loss_dict=total_loss_dict,
     )
+
+
+def track_moe_balance(
+    model: List[torch.nn.Module],
+    iteration: int,
+    writer,
+    wandb_writer=None,
+):
+    """Dragon: log the normalized entropy of the expert load of every MoE layer (1 = balanced),
+    from the token counts the expert-bias update saved (router.local_tokens_per_expert2)."""
+    tokens_per_layer = {}  # layer_id -> (n_experts,)
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if getattr(module, 'expert_bias', None) is not None and hasattr(
+                module, 'local_tokens_per_expert2'
+            ):
+                layer_id = int(module.layer_number)
+                assert layer_id not in tokens_per_layer, f"duplicate MoE layer {layer_id}"
+                tokens_per_layer[layer_id] = module.local_tokens_per_expert2.detach().clone()
+
+    if len(tokens_per_layer) == 0:
+        return
+
+    layer_ids = sorted(tokens_per_layer.keys())
+    counts = torch.stack([tokens_per_layer[i] for i in layer_ids], dim=0).float()
+    denom = counts.sum(dim=1, keepdim=True).clamp_min(1.0)
+    p = counts / denom
+    ent = -(p * p.clamp_min(1e-12).log()).sum(dim=1)  # (n_layers,)
+    norm = math.log(counts.size(1)) if counts.size(1) > 1 else 1.0
+    ent_norm = (ent / norm).tolist()  # (n_layers,) in [0,1]
+
+    if writer is not None:
+        for layer_i, layer_id in enumerate(layer_ids):
+            writer.add_scalar(f"moe_balance_entropy/layer_{layer_id}", ent_norm[layer_i], iteration)
+
+    if wandb_writer:
+        wandb_writer.log(
+            {
+                f"moe/layer_{layer_id}_balance_entropy": ent_norm[layer_i]
+                for layer_i, layer_id in enumerate(layer_ids)
+            },
+            iteration,
+        )
 
 
 def get_updated_expert_bias(
@@ -1279,6 +1344,64 @@ def get_updated_expert_bias(
             expert_bias + update_direction.to(dtype=expert_bias.dtype) * expert_bias_update_rate
         )
         return updated_expert_bias
+
+
+def get_updated_expert_bias_pid(
+    tokens_per_expert,
+    expert_bias,
+    error_integral,
+    prev_error,
+    kp,
+    ki,
+    kd,
+    integral_max=10.0,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Update expert bias using a PID controller for smoother load balancing (Dragon).
+
+    Instead of a sign-based step, uses proportional-integral-derivative control
+    on the normalized error (average_tokens - tokens_per_expert) / average_tokens.
+
+    Args:
+        tokens_per_expert (torch.Tensor): Shape [num_layers, num_experts].
+        expert_bias (torch.Tensor): Shape [num_layers, num_experts].
+        error_integral (torch.Tensor): Accumulated integral of error, same shape.
+        prev_error (torch.Tensor): Error from previous step, same shape.
+        kp (float): Proportional gain.
+        ki (float): Integral gain.
+        kd (float): Derivative gain.
+        integral_max (float): Clamp magnitude for the integral term to prevent windup.
+        tp_dp_cp_group: group over which token counts are summed (default: global TPxDPxCP).
+
+    Returns:
+        Tuple of (updated_expert_bias, updated_error_integral, current_error).
+    """
+    with torch.no_grad():
+        if tp_dp_cp_group is None:
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+        # All Reduce Across TPxCPxDP group
+        torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
+        tokens_per_expert = tokens_per_expert.float()
+        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
+
+        # Normalized error: positive means expert is underloaded
+        error = (average_tokens - tokens_per_expert) / average_tokens.clamp(min=1.0)
+
+        # Integral with anti-windup clamping
+        new_integral = (error_integral + error).clamp(-integral_max, integral_max)
+
+        # On cold start (prev_error is all zeros), suppress the derivative kick
+        # by treating the current error as the baseline.
+        cold_start = prev_error.abs().sum() == 0
+        derivative = error - prev_error if not cold_start else torch.zeros_like(error)
+
+        # PID output
+        pid_output = kp * error + ki * new_integral + kd * derivative
+        updated_expert_bias = expert_bias + pid_output
+
+        return updated_expert_bias, new_integral, error
 
 
 def maybe_move_tensor_to_cpu(
@@ -1418,6 +1541,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
         router_dtype: torch.dtype,
+        alpha: float = 1.0,
     ) -> torch.Tensor:
         """
         Forward pass of the RouterGatingLinearFunction function.
@@ -1432,6 +1556,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             torch.Tensor: The output tensor.
         """
         ctx.save_for_backward(inp, weight, bias)
+        ctx.alpha = alpha
         ctx.router_dtype = router_dtype
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
@@ -1443,12 +1568,16 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
             # small bias vector before passing it to TE.
             gemm_bias = bias.to(router_dtype) if bias is not None else None
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=gemm_bias)[0]
+            output = te_general_gemm(
+                weight, inp, router_dtype, layout="TN", bias=gemm_bias, alpha=alpha
+            )[0]
         elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+            if alpha != 1.0:
+                output = output * alpha
         else:
             output = torch.addmm(
-                bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t()
+                bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t(), alpha=alpha
             )
 
         output = output.view(*inp_shape[:-1], -1)
@@ -1476,24 +1605,40 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
         if te_general_gemm is not None and ctx.router_dtype != torch.float64:
             grad_input = te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+                weight.to(ctx.router_dtype),
+                grad_output,
+                ctx.router_dtype,
+                layout="NN",
+                grad=True,
+                alpha=ctx.alpha,
             )
             grad_weight = te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+                inp.to(ctx.router_dtype),
+                grad_output,
+                ctx.router_dtype,
+                layout="NT",
+                grad=True,
+                alpha=ctx.alpha,
             )
             grad_input = grad_input[0].to(ctx.input_dtype)
             grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
-            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)) * ctx.alpha
+            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)) * ctx.alpha
+            grad_input = grad_input.to(ctx.input_dtype)
+            grad_weight = grad_weight.to(ctx.weight_dtype)
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
-        return grad_input, grad_weight, grad_bias, None
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 def router_gating_linear(
-    inp: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], router_dtype: torch.dtype
+    inp: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    router_dtype: torch.dtype,
+    alpha: float = 1.0,
 ) -> torch.Tensor:
     """
     Customized linear layer for router gating.
@@ -1509,7 +1654,7 @@ def router_gating_linear(
     Returns:
         torch.Tensor: The output tensor.
     """
-    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype, alpha)
 
 
 def get_align_size_for_quantization(config: TransformerConfig) -> int:

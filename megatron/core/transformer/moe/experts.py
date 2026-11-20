@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from itertools import chain
 from math import ceil
 from typing import Optional, Protocol, Tuple
+import math
 
 import torch
 import torch.nn.functional as F
@@ -32,6 +33,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.transformer.mlp import (
+    dragon_alpha_kwargs,
     MLP,
     MLPSubmodules,
     TEActivationFunctionBuilder,
@@ -253,6 +255,8 @@ class TEGroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
+        if hasattr(self.config, 'moe_routed_input_dim') and self.config.moe_routed_input_dim:
+            self.input_size = self.config.moe_routed_input_dim
         assert not (
             self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
@@ -284,11 +288,13 @@ class TEGroupedMLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
+        # Dragon (u-muP): fc2 alpha GEMM
+        fc2_alpha = 2 / math.sqrt(5) if getattr(self.config, 'use_uscaling', False) else None
         self.linear_fc2 = submodules.linear_fc2(
             self.num_local_experts,
             not_none(self.config.moe_ffn_hidden_size),
             (
-                self.config.hidden_size
+                self.input_size
                 if self.config.moe_latent_size is None
                 else self.config.moe_latent_size
             ),
@@ -300,6 +306,7 @@ class TEGroupedMLP(MegatronModule):
             tp_comm_buffer_name='fc2',
             pg_collection=pg_collection,
             name=(name + ".linear_fc2") if name is not None else None,
+            **dragon_alpha_kwargs(fc2_alpha),
         )
 
         self.offload_expert_fc1 = (
@@ -1036,7 +1043,11 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = self._remove_glu_interleaving(
                         intermediate_parallel, self.config.moe_mlp_glu_interleave_size
                     )
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                # Dragon: TE activation kernels fail on empty tensors (an EP rank can get no tokens)
+                if intermediate_parallel.numel() == 0:
+                    intermediate_parallel = self.config.activation_func(intermediate_parallel)
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
                     original_dtype = intermediate_parallel.dtype
                     intermediate_parallel = intermediate_parallel * permuted_probs
@@ -1166,6 +1177,10 @@ class TEGroupedMLP(MegatronModule):
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
+            # Dragon: the activation module (TE op) has no parameters, only _extra_state, shared
+            # by the local experts: it would produce duplicate ShardedObject keys under EP.
+            if name == 'activation_func':
+                continue
             sub_sd = sharded_state_dict_default(
                 module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
             )

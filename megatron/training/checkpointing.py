@@ -43,6 +43,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
+from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
 from megatron.core.post_training.modelopt.checkpointing import (
@@ -741,6 +742,19 @@ def save_checkpoint(
     # progress is recorded separately via the post-logits finalize (see the async block below).
     skip_weight_ckpt = getattr(args, 'freeze_all_layers', False)
 
+    world_sz  = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    src_rank  = world_sz - 1
+    wandb_id, last_step = None, None
+    if not torch.distributed.is_initialized() or is_last_rank():
+        writer      = wandb_utils.get_wandb_writer()
+        if writer is not None and writer.run is not None:
+            wandb_id      = writer.run.id
+            last_step   = writer.run.step
+    payload = [wandb_id, last_step]
+    if torch.distributed.is_initialized():
+        torch.distributed.broadcast_object_list(payload, src=src_rank)
+    wandb_id, last_step = payload
+
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
     ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
@@ -883,6 +897,8 @@ def save_checkpoint(
                 optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
                 model_sd_kwargs=dict(metadata=sharded_sd_metadata),
                 rerun_state=rerun_state,
+                wandb_id=wandb_id,
+                wandb_step=last_step,
             )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
@@ -1742,6 +1758,8 @@ def generate_state_dict(
     optim_sd_kwargs=None,
     model_sd_kwargs=None,
     rerun_state=None,
+    wandb_id=None,
+    wandb_step=None,
 ):
     """Generate a state dict from given model, optimizer, scheduler, rng state and others."""
 
@@ -1749,6 +1767,14 @@ def generate_state_dict(
     state_dict = {}
     state_dict['args'] = args
     state_dict['checkpoint_version'] = 3.1
+    # Dragon: CompleteDP warmup size + wandb run to fork from on resume
+    state_dict['wsize'] = (
+        opt_param_scheduler.get_wsize()
+        if opt_param_scheduler is not None and hasattr(opt_param_scheduler, 'get_wsize')
+        else None
+    )
+    state_dict['wandb_id'] = wandb_id
+    state_dict['wandb_step'] = wandb_step
     if iteration is not None:
         state_dict['iteration'] = iteration
 
@@ -2902,16 +2928,15 @@ def load_checkpoint(
                         '--no-load-optim '
                         'to start from a fresh optimizer.'
                     )
-                if (
-                    ckpt_tp_pp != run_tp_pp
-                    and sharded_sd_metadata['distrib_optim_sharding_type']
-                    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
-                ):
-                    raise RuntimeError(
-                        f'{mismatch_msg}: not supported for DistributedOptimizer with sharding type'
-                        f' {sharded_sd_metadata["distrib_optim_sharding_type"]}.'
-                        f' Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.'
-                    )
+                # Dragon: TP/PP resharding check disabled (loads checkpoints across layouts).
+                #if (
+                #    ckpt_tp_pp != run_tp_pp
+                #    and sharded_sd_metadata['distrib_optim_sharding_type']
+                #    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+                #):
+                #    raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
+                #                       f" {sharded_sd_metadata['distrib_optim_sharding_type']}."
+                #                       f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.")
 
                 # Check if fully parallel load is compatible with sharding type
                 if (
@@ -3118,6 +3143,15 @@ def load_checkpoint(
         **load_kwargs,
     )
 
+    if state_dict is not None:
+        if not args.reset_training:
+            args.wandb_fork_from_id = getattr(args, 'wandb_fork_from_id', None) or state_dict.get('wandb_id')
+            args.wandb_fork_from_step = getattr(args, 'wandb_fork_from_step', None) or state_dict.get('wandb_step')
+        else:
+            print("Reset training: will not fork wandb from previous checkpoint")
+            args.wandb_fork_from_id = None
+            args.wandb_fork_from_step = None
+
     # Checkpoint not loaded.
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
@@ -3183,6 +3217,14 @@ def load_checkpoint(
             args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
             args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
             args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
+        if args.reset_training:
+            # A new phase (new data, new GBS): the samplers restart at 0 (training/datasets/data_samplers.py), so
+            # the counters must too, or this run's checkpoints carry the seed's counts and cannot be resumed.
+            print_rank_0("Reset training: setting consumed train / valid samples to 0")
+            args.consumed_train_samples = 0
+            args.skipped_train_samples = 0
+            args.consumed_valid_samples = 0
+            update_num_microbatches(consumed_samples=0, verbose=True)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 

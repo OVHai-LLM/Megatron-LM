@@ -161,6 +161,7 @@ from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
     initialize_megatron,
+    initialize_wandb,
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
@@ -899,6 +900,124 @@ def _dsv4_attention_flops(args, layer_counts, total_tokens, seqlen_squared_sum):
     return 6 * (token_term * total_tokens + core_term * seqlen_squared_sum)
 
 
+_DRAGON_FLOPS_CACHE = {}
+
+
+def _dragon_attention_layer_flops(
+    batch_size, seq_len, hidden_size, num_heads, num_signal_heads, kv_channels, tpa_rank=4,
+):
+    """Calculate FLOPs for the forward of an Dragon attention layer."""
+    return (
+        (
+            2
+            * batch_size
+            * seq_len
+            * hidden_size
+            * (num_heads * (kv_channels + tpa_rank) + num_signal_heads * kv_channels + 2 * tpa_rank * kv_channels)
+        )  # in_proj
+        + 2 * batch_size * num_heads * kv_channels * seq_len * seq_len  # core attention
+        + batch_size * seq_len * num_signal_heads * kv_channels  # gate
+        + 2 * batch_size * seq_len * num_signal_heads * kv_channels * hidden_size  # out_proj
+    )
+
+
+def _dragon_gdn_layer_flops(batch_size, seq_len, hidden_size, qk_head_dim, v_head_dim, num_heads, conv_size):
+    """Calculate FLOPs for the forward of a Dragon GDN layer."""
+    qk_dim = qk_head_dim * num_heads
+    v_dim = v_head_dim * num_heads
+    return (
+        (2 * batch_size * seq_len * hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_heads))  # in_proj
+        + batch_size * seq_len * conv_size * (2 * qk_dim + v_dim)  # conv1d
+        + batch_size * seq_len * num_heads * 4 * v_head_dim * v_head_dim  # scan
+        + batch_size * seq_len * v_dim  # gate
+        + 2 * batch_size * seq_len * v_dim * hidden_size  # out_proj
+    )
+
+
+def _dragon_mamba3_mimo_layer_flops(batch_size, seq_len, hidden_size, state_dim=16, head_dim=64,
+                                    num_groups=1, num_heads=128, mimo_rank=4, mimo_proj_block_order=1):
+    """Calculate FLOPs for the forward of a Mamba3 MIMO layer."""
+    d_inner = 2 * hidden_size
+    nheads = num_heads if num_heads else d_inner // head_dim
+    return (
+        (2 * batch_size * seq_len * hidden_size
+         * (2 * d_inner + 2 * num_groups * mimo_rank * state_dim + 3 * nheads))  # in_proj
+        + 6 * batch_size * seq_len * d_inner * mimo_rank * mimo_proj_block_order
+        + (7 * batch_size * seq_len * d_inner * state_dim * ((4 * mimo_rank + 2) / 5))  # scan
+        + batch_size * seq_len * mimo_rank * d_inner  # gate
+        + 2 * batch_size * seq_len * nheads * head_dim * hidden_size  # out_proj
+    )
+
+
+def dragon_num_floating_point_operations(args, batch_size):
+    """FLOPs of one global batch of a Dragon model (dense BSHD estimate at args.seq_length)."""
+    cache_key = (id(args), batch_size)
+    if cache_key in _DRAGON_FLOPS_CACHE:
+        return _DRAGON_FLOPS_CACHE[cache_key]
+    if args.num_experts is None:
+        num_dense_layers = args.num_layers
+        num_moe_layers = 0
+        num_experts_routed_to = 0
+        last_layer_is_moe = 0
+    else:
+        num_moe_layers = args.num_layers - args.num_first_mlp
+        num_dense_layers = args.num_layers - num_moe_layers
+        num_experts_routed_to = args.moe_router_topk
+        last_layer_is_moe = True
+
+    if args.mtp_num_layers is not None:
+        mtp_num_layers = args.mtp_num_layers
+        num_moe_layers += last_layer_is_moe * mtp_num_layers
+        num_dense_layers += (1 - last_layer_is_moe) * mtp_num_layers
+        num_layers = args.num_layers + mtp_num_layers
+    else:
+        mtp_num_layers = 0
+        num_layers = args.num_layers
+
+    moe_ffn_hidden_size = args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None else args.ffn_hidden_size
+    shared_expert_ffn_hidden_size = (
+        0 if args.moe_shared_expert_intermediate_size is None else args.moe_shared_expert_intermediate_size
+    )
+    gated_linear_multiplier = 3 / 2 if args.swiglu else 1
+    # 3x (fwd, wgrad, dgrad) * 2x (two GEMMs per MLP) * 2x (2mnk)
+    expansion_factor = 3 * 2 * 2
+
+    seq_length = args.seq_length
+    num_attn_layers = args.layers_mixer_config.count("V")
+    num_gdn_layers = args.layers_mixer_config.count("g")
+    num_mamba3_layers = args.layers_mixer_config.count("M")
+    mixer_attn_flops = mixer_gdn_flops = mixer_mamba3_flops = 0
+    if num_attn_layers:
+        mixer_attn_flops = 3 * _dragon_attention_layer_flops(
+            batch_size, seq_length, args.hidden_size, args.num_attention_heads,
+            args.num_signal_heads, args.kv_channels, args.tpa_rank)
+    if num_gdn_layers:
+        mixer_gdn_flops = 3 * _dragon_gdn_layer_flops(
+            batch_size, seq_length, args.hidden_size, args.linear_key_head_dim,
+            args.linear_value_head_dim, args.linear_num_key_heads, args.linear_conv_kernel_dim)
+    if num_mamba3_layers:
+        mixer_mamba3_flops = 3 * _dragon_mamba3_mimo_layer_flops(
+            batch_size, seq_length, args.hidden_size, args.mamba_state_dim, args.mamba_head_dim,
+            args.mamba_num_groups, args.mamba_num_heads, args.mamba_mimo_dim,
+            args.mamba_mimo_proj_block_order)
+
+    flops = (
+        batch_size * seq_length * expansion_factor * num_layers * args.hidden_size
+        * (
+            (args.ffn_hidden_size * gated_linear_multiplier) * (num_dense_layers / num_layers)
+            + (moe_ffn_hidden_size * num_experts_routed_to * gated_linear_multiplier) * (num_moe_layers / num_layers)
+            + (shared_expert_ffn_hidden_size * gated_linear_multiplier) * (num_moe_layers / num_layers)
+        )
+        + mixer_attn_flops * num_attn_layers
+        + mixer_gdn_flops * num_gdn_layers
+        + mixer_mamba3_flops * num_mamba3_layers
+        + 3 * 2 * batch_size * seq_length * mtp_num_layers * (3 * args.hidden_size + 2 * args.hidden_size * args.hidden_size)
+        + batch_size * seq_length * 3 * 2 * args.hidden_size * args.padded_vocab_size * (mtp_num_layers + 1)
+    )
+    _DRAGON_FLOPS_CACHE[cache_key] = flops
+    return flops
+
+
 def num_floating_point_operations(
     args,
     batch_size,
@@ -929,6 +1048,9 @@ def num_floating_point_operations(
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
     """
+    if getattr(args, 'is_dragon_model', False):
+        return int(dragon_num_floating_point_operations(args, batch_size))
+
     # Multimodal --seq-length describes the encoder, while the language model
     # runs at --decoder-seq-length. Plain language models leave the latter unset.
     llm_seq_length = (
@@ -1685,6 +1807,7 @@ def pretrain(
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
     callbacks: list[Callback] | CallbackManager | None = None,
+    g_scheduler=None,
 ):
     """Main training program.
 
@@ -2038,6 +2161,12 @@ def pretrain(
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
+
+    # Dragon: expose the scheduler to the forward step (SLW), and start wandb only now, after the
+    # checkpoint load set args.wandb_fork_from_id / _step (see global_vars.initialize_runtime_services).
+    if g_scheduler is not None:
+        g_scheduler['scheduler'] = opt_param_scheduler
+    initialize_wandb(args)
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -2742,6 +2871,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             flush=True,
         )
 
+    print_rank_0(model)  # Dragon: print the model structure
+
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
@@ -2892,6 +3023,25 @@ def get_optimizer_param_scheduler(optimizer):
         end_wd=args.end_weight_decay,
         wd_incr_steps=wd_incr_steps,
         wd_incr_style=args.weight_decay_incr_style,
+        # Dragon: sliding-window-length schedule, AdEMAMix beta3 / alpha warmups, CompleteDP.
+        slw_warmup_steps=args.slw_warmup_steps,
+        slw_warmup_offset=args.slw_warmup_offset,
+        slw_start=args.slw_start,
+        slw_end=args.slw_end,
+        slw_increment=args.slw_increment,
+        global_batch_size=args.global_batch_size,
+        optim=args.optimizer,
+        beta1=args.adam_beta1,
+        beta2=args.adam_beta2,
+        beta3=args.ademamix_beta3,
+        alpha=args.ademamix_alpha,
+        beta3_warmup_steps=(args.ademamix_beta3_warmup_steps
+                            if args.ademamix_beta3_warmup_steps is not None else args.train_iters),
+        alpha_warmup_steps=(args.ademamix_alpha_warmup_steps
+                            if args.ademamix_alpha_warmup_steps is not None else args.train_iters),
+        use_completedp=args.use_completedp,
+        rhosq_adjusted=(args.train_iters_base / (args.completedp_train_iters or args.train_iters)
+                        if args.use_completedp else None),
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
@@ -3113,12 +3263,29 @@ def setup_model_and_optimizer(
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
+        # Dragon: uscaling / CompleteDP LR, WD and eps multipliers (and the Dragon LR groups:
+        # lr_emb / lr_head / lr_scalar / lr_expert, read from the config inside the factory).
+        completedp_train_iters = getattr(args, 'completedp_train_iters', None) or args.train_iters
         optimizer = get_megatron_optimizer(
             config,
             model,
             config_overrides=config_overrides,
             use_gloo_process_groups=args.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            uscaling=args.use_uscaling,
+            completedp=args.use_completedp,
+            alpha_completedp=args.completedp_alpha,
+            rho_adjusted=(
+                math.sqrt(args.train_iters_base / completedp_train_iters)
+                if args.use_completedp else None
+            ),
+            width_adjusted=(
+                args.hidden_size / args.hidden_size_base if args.use_completedp else None
+            ),
+            depth_adjusted=(
+                len(args.layers_mixer_config) / len(args.layers_mixer_config_base)
+                if args.use_completedp else None
+            ),
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
@@ -3180,6 +3347,15 @@ def setup_model_and_optimizer(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
+        # Dragon (JZ port): loading the optimizer restores every param-group hyperparameter from the
+        # checkpoint, max_lr / min_lr included, and get_lr() prefers the group's value over the
+        # scheduler's. With --override-opt-param-scheduler, put the current config's per-group
+        # max_lr / min_lr (Dragon LR groups) back on the loaded groups (same order); everything
+        # else (Adam moments, the FusedAdam 'step') stays as loaded.
+        lr_snapshot = None
+        if optimizer is not None and args.override_opt_param_scheduler:
+            lr_snapshot = [(g.get('max_lr'), g.get('min_lr')) for g in optimizer.param_groups]
+        _print_lr_groups(optimizer, "before load")
         with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load', is_goodput_span=True):
 
             ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
@@ -3203,6 +3379,25 @@ def setup_model_and_optimizer(
             )
             # Checkpoint loading restores progress; training owns the runtime calculator.
             update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
+        _print_lr_groups(optimizer, "as loaded")
+        if lr_snapshot is not None:
+            groups = optimizer.param_groups
+            assert len(groups) == len(lr_snapshot), (len(groups), len(lr_snapshot))
+            for g, (max_lr, min_lr) in zip(groups, lr_snapshot):
+                if max_lr is not None:
+                    g['max_lr'] = max_lr
+                if min_lr is not None:
+                    g['min_lr'] = min_lr
+            if opt_param_scheduler is not None:
+                if args.reset_training:
+                    # A new phase from a finished run: restart the LR schedule (warmup / decay
+                    # counted from 0) while keeping the loaded optimizer state.
+                    opt_param_scheduler.num_steps = 0
+                opt_param_scheduler.step(increment=0)  # recompute each group's lr / wd
+        _print_lr_groups(optimizer, "after load")
+        if args.reset_training:
+            print_rank_0("Reset training: setting iteration to 0.")
+            args.iteration = 0
         # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
         # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
         # LOAD is uniform across ranks (~ms spread), so no meaningful skew
@@ -3278,7 +3473,44 @@ def setup_model_and_optimizer(
         torch.distributed.barrier()
         exit()
 
+    if os.environ.get("DRAGON_PRINT_INIT_STATS", "0") == "1":
+        _print_named_param_init_stats(model)
+
     return model, optimizer, opt_param_scheduler
+
+
+@torch.no_grad()
+def _print_named_param_init_stats(model, *, max_name=80, only_trainable=True):
+    """Dragon debug (DRAGON_PRINT_INIT_STATS=1): mean / std of every non-expert parameter."""
+    print_rank_0("=== Model init stats (named params) ===")
+    header = f"{'name':{max_name}}  {'shape':>16}  {'dtype':>10}  {'device':>10}  {'mean':>12}  {'std':>12}"
+    print_rank_0(header)
+    print_rank_0("-" * len(header))
+    for name, p in model[0].named_parameters():
+        if only_trainable and not p.requires_grad:
+            continue
+        if "mlp.experts.linear" in name:
+            continue
+        x = p.detach().float()
+        nm = name if len(name) <= max_name else ("…" + name[-(max_name - 1):])
+        print_rank_0(
+            f"{nm:{max_name}}  {str(tuple(p.shape)):>16}  {str(p.dtype):>10}  {str(p.device):>10}  "
+            f"{x.mean().item():12.5e}  {x.std(unbiased=False).item():12.5e}"
+        )
+    print_rank_0("")
+
+
+def _print_lr_groups(optimizer, when):
+    """DRAGON_PRINT_LR_GROUPS=1: rank 0 prints every optimizer param group's LR hyperparameters."""
+    if optimizer is None or os.environ.get("DRAGON_PRINT_LR_GROUPS", "0") != "1":
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    for i, g in enumerate(optimizer.param_groups):
+        n = sum(p.numel() for p in g['params'])
+        print(f"[lr-groups {when}] {i}: max_lr={g.get('max_lr')} min_lr={g.get('min_lr')} lr={g.get('lr')} "
+              f"lr_mult={g.get('lr_mult')} wd_mult={g.get('wd_mult')} wd={g.get('weight_decay')} "
+              f"betas={g.get('betas')} step={g.get('step')} expert={g.get('is_expert_parallel')} numel={n}", flush=True)
 
 
 def dummy_train_step(data_iterator):
@@ -3562,6 +3794,33 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         losses_reduced, args, model_pg_collection
     )
 
+    # Dragon: per-parameter gradient norms before the optimizer step (pre-clip), while main_grad
+    # is still on the model params. Only at log intervals (--log-grad-norm-per-param).
+    if getattr(args, 'log_grad_norm_per_param', False) and \
+            hasattr(args, 'curr_iteration') and \
+            args.curr_iteration % args.log_interval == 0:
+        per_param_grad_norms = {}
+        per_param_grad_to_param_ratio = {}
+        for chunk_idx, model_chunk in enumerate(model):
+            prefix = f"chunk{chunk_idx}/" if len(model) > 1 else ""
+            for name, param in model_chunk.named_parameters():
+                grad = getattr(param, 'main_grad', None)
+                if grad is None:
+                    grad = param.grad
+                if grad is not None:
+                    key = prefix + name.replace("_orig_mod.", "")
+                    grad_norm = torch.norm(grad.detach().float(), 2.0).item()
+                    param_norm = torch.norm(param.detach().float(), 2.0).item()
+                    per_param_grad_norms[key] = grad_norm
+                    per_param_grad_to_param_ratio[key] = (
+                        grad_norm / param_norm if param_norm > 0 else float('inf')
+                    )
+        args._per_param_grad_norms = per_param_grad_norms
+        args._per_param_grad_to_param_ratio = per_param_grad_to_param_ratio
+    else:
+        args._per_param_grad_norms = None
+        args._per_param_grad_to_param_ratio = None
+
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=config.barrier_with_L1_time)
@@ -3750,6 +4009,9 @@ def training_log(
     model=None,
     callback_manager: CallbackManager | None = None,
     packed_sequence_stats: Optional[Dict[str, float]] = None,
+    wsize=None,
+    beta3=None,
+    alpha=None,
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
@@ -3862,6 +4124,13 @@ def training_log(
             writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'learning-rate': learning_rate}, iteration)
+        # Dragon: sliding-window size and AdEMAMix beta3 / alpha schedules.
+        for _name, _value in (('wsize', wsize), ('beta3', beta3), ('alpha', alpha)):
+            if _value is not None:
+                writer.add_scalar(_name, _value, iteration)
+                writer.add_scalar(f'{_name} vs samples', _value, args.consumed_train_samples)
+                if wandb_writer:
+                    wandb_writer.log({_name: _value}, iteration)
         if args.skipped_train_samples > 0:
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
@@ -3897,6 +4166,15 @@ def training_log(
             writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
+        if wandb_writer and getattr(args, '_per_param_grad_norms', None):
+            per_param_metrics = {
+                f'grad-norm-per-param/{k}': v for k, v in args._per_param_grad_norms.items()
+            }
+            per_param_metrics.update({
+                f'grad-norm-over-param-norm/{k}': v
+                for k, v in args._per_param_grad_to_param_ratio.items()
+            })
+            wandb_writer.log(per_param_metrics, iteration)
         if num_zeros_in_grad is not None:
             writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar(
@@ -3978,6 +4256,11 @@ def training_log(
                 moe_layer_pattern = args.moe_layer_freq
             else:
                 raise ValueError(f"Invalid moe_layer_freq: {args.moe_layer_freq}")
+            if getattr(args, 'is_dragon_model', False) and getattr(args, 'num_first_mlp', 0):
+                # Dragon: the first --num-first-mlp layers have a dense MLP.
+                moe_layer_pattern = [
+                    0 if i < args.num_first_mlp else v for i, v in enumerate(moe_layer_pattern)
+                ]
             main_moe_layers = sum(moe_layer_pattern)
             # Other stacks select hash routing by transformer-layer number.
             num_hash_layers = sum(moe_layer_pattern[: max(args.moe_num_hash_layers, 0)])
@@ -4003,6 +4286,13 @@ def training_log(
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
+        if getattr(args, 'is_dragon_model', False) and model is not None and iteration % 50 == 0:
+            # Dragon: expert load-balance statistics (entropy, ...) to tensorboard / wandb.
+            from megatron.core.transformer.moe.moe_utils import track_moe_balance
+
+            track_moe_balance(
+                model=model, iteration=iteration, writer=writer, wandb_writer=wandb_writer
+            )
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
@@ -4090,6 +4380,8 @@ def training_log(
         )
         if cfg.logger.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            token_throughput = batch_size * args.seq_length / elapsed_time_per_iteration
+            log_string += f' token throughput (Tokens/s): {token_throughput:.1f} |'
             if cfg.logger.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
@@ -4109,6 +4401,12 @@ def training_log(
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         if learning_rate is not None:
             log_string += f' learning rate: {learning_rate:.6E} |'
+        if wsize is not None:
+            log_string += f' wsize: {wsize} |'
+        if beta3 is not None:
+            log_string += f' beta3: {beta3:.6f} |'
+        if alpha is not None:
+            log_string += f' alpha: {alpha:.6f} |'
         log_string += f' global batch size: {batch_size:5d} |'
 
         # OTel: snapshot the accumulator state BEFORE it is torn down. The loop directly
@@ -4242,6 +4540,11 @@ def training_log(
 def _should_compute_params_norm(args, iteration, is_first_iteration):
     """Whether this iteration can emit the parameter norm."""
     cfg = get_run_config()
+    if getattr(args, 'is_dragon_model', False):
+        # Dragon: the (blocking) params norm only at log intervals.
+        return cfg.logger.log_params_norm and (
+            is_first_iteration or iteration % cfg.logger.log_interval == 0
+        )
     return cfg.logger.log_params_norm and (
         is_first_iteration
         or iteration % cfg.logger.log_interval == 0
@@ -4406,6 +4709,11 @@ def save_checkpoint_and_time(
             # Gate on the full data-distribution group so gtp_remat peers do not each report.
             report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
 
+        # Dragon: reclaim memory from eval / training temporaries before saving (avoids OOM on
+        # save, incl. the end-of-training save which also goes through this function).
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Save checkpoint.
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}):
             save_checkpoint(
@@ -4438,12 +4746,12 @@ def save_checkpoint_and_time(
                 report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
         num_checkpoints_memory_reported += 1
 
-        if args.fp8:
-            # Run garbage collection after checkpoint saving to free memory from
-            # dequantized bf16 tensors that were temporarily created during fp8
-            # model checkpoint saving.
-            with _otel_managed_span('checkpoint', 'megatron.checkpoint.gc_collect', is_goodput_span=True):
-                gc.collect()
+        # Run garbage collection after checkpoint saving to free memory from temporary tensors
+        # (fp8 dequantized copies, state_dict copies, NCCL buffers, .contiguous() TP shards).
+        # Dragon: always, not only with fp8 (GPU OOM after checkpoint save).
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.gc_collect', is_goodput_span=True):
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # timers.log reports min & max across ranks -> a collective. Sitting right
         # after the per-rank-imbalanced save (and outside the save spans), it's a
@@ -5514,6 +5822,13 @@ def train(
                     model=model,
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
+                    # Dragon scheduler state (sliding window, AdEMAMix beta3 / alpha)
+                    wsize=(opt_param_scheduler.get_wsize()
+                           if hasattr(opt_param_scheduler, 'get_wsize') else None),
+                    beta3=(opt_param_scheduler.get_beta3()
+                           if hasattr(opt_param_scheduler, 'get_beta3') else None),
+                    alpha=(opt_param_scheduler.get_alpha()
+                           if hasattr(opt_param_scheduler, 'get_alpha') else None),
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5971,7 +6286,7 @@ def evaluate_and_print_results(
 
         # with full validation we need to distribute eval_iters to all ranks
         if mpu.get_tensor_model_parallel_rank() == 0:
-            eval_iters = torch.tensor(args.eval_iters, dtype=torch.long, device='cuda')
+            eval_iters = torch.tensor(eval_iters, dtype=torch.long, device='cuda')  # Dragon fix
         else:
             eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
         torch.distributed.broadcast(eval_iters, 0)
@@ -6263,12 +6578,21 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                     )
                     args.eval_iters = eval_iters_tensor.tolist()
             else:
-                local_eval_iters = len(valid_dataloaders[0])
+                # Dragon: non-TP-src ranks may have no dataloader.
+                local_eval_iters = (
+                    len(valid_dataloaders[0]) if valid_dataloaders[0] is not None else 0
+                )
                 eval_iters_tensor = torch.tensor([local_eval_iters], dtype=torch.long, device='cuda')
                 torch.distributed.all_reduce(
                     eval_iters_tensor,
                     op=torch.distributed.ReduceOp.MAX,
                     group=mpu.get_data_parallel_group(with_context_parallel=True),
+                )
+                # Dragon: make args.eval_iters identical over TP too (checkpoint args validation).
+                torch.distributed.broadcast(
+                    eval_iters_tensor,
+                    mpu.get_tensor_model_parallel_src_rank(),
+                    group=mpu.get_tensor_model_parallel_group(),
                 )
                 args.eval_iters = eval_iters_tensor.item()
 

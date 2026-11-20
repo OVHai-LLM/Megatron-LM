@@ -92,6 +92,20 @@ class SFTTokenizer:
                 has_bos=False,
                 has_system_role=True,
             )
+        elif prompt_format in ("dragon", "hf-assistant-mask"):
+            # Dragon (OVHai): the HF tokenizer's own chat template, with its assistant-token
+            # masking ({% generation %} blocks) building the loss mask. pad = pad, else eos.
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,
+                pad_token_id=(
+                    tokenizer.pad_token_id
+                    if tokenizer.pad_token_id is not None
+                    else tokenizer.eos_token_id
+                ),
+                custom_chat_template=tokenizer.chat_template,
+                has_bos=tokenizer.bos_token_id is not None,
+                has_system_role=True,
+            )
         elif prompt_format == "default":
             self._prompt_config = PromptConfig(
                 assistant_prefix_len=0,
@@ -152,6 +166,12 @@ class SFTTokenizer:
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
         """
+        if return_target and self._prompt_format in ("dragon", "hf-assistant-mask"):
+            tokens, assistant_mask = self.tokenize_sample({"messages": conversation})
+            target = tokens.copy()
+            target[assistant_mask == 0] = IGNORE_INDEX
+            return tokens, target
+
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
@@ -220,6 +240,31 @@ class SFTTokenizer:
 
         return tokens, target
 
+    def tokenize_sample(self, sample: Dict):
+        """Dragon's SFT tokenization: (input_ids, assistant mask) with the HF chat template.
+
+        Args:
+            sample (Dict): a data sample with key "messages" (system/user/assistant turns) and an
+                optional "chat_template_kwargs" dict forwarded to apply_chat_template.
+
+        Returns:
+            (np.ndarray, np.ndarray): token ids and a mask that is 1 on assistant tokens (the
+            tokens to train on), 0 elsewhere. NOT shifted: the dataset applies the causal shift.
+        """
+        out = self._hf_tokenizer.apply_chat_template(
+            sample["messages"],
+            tokenize=True,
+            add_generation_prompt=False,
+            return_assistant_tokens_mask=True,
+            return_tensors="np",
+            return_dict=True,
+            **sample.get("chat_template_kwargs", {}),
+        )
+        tokens = self._extract_token_ids(out["input_ids"])
+        mask = np.asarray(out["assistant_masks"])
+        mask = mask[0] if mask.ndim == 2 else mask
+        return tokens, mask
+
     def text_to_ids(self, text: Union[str, List[Dict]], add_special_tokens: bool = True):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
@@ -271,7 +316,12 @@ class SFTTokenizer:
     @property
     def eod(self):
         """End of sentence token ID."""
-        return self._tokenizer.eos_token_id
+        return self._hf_tokenizer.eos_token_id
+
+    @property
+    def eos_id(self):
+        """EOS token ID (MegatronDataset reads tokenizer.eos)."""
+        return self._hf_tokenizer.eos_token_id
 
     @property
     def vocab(self):

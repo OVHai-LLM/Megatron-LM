@@ -146,6 +146,8 @@ param_group_identifier_keys = (
     'lr_mult',
     'is_expert_parallel',
     'is_decoupled_lr',
+    # Dragon: CompleteDP gives each group its own Adam eps (groups may differ only by eps).
+    'eps',
 )
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'

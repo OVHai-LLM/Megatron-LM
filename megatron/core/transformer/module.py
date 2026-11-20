@@ -105,6 +105,7 @@ class MegatronModule(torch.nn.Module):
         prefix: str = '',
         sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
         metadata: Optional[dict] = None,
+        tensor_parallel_layers_axis_map: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Default implementation for sharded state dict for distributed checkpointing.
 
@@ -134,6 +135,7 @@ class MegatronModule(torch.nn.Module):
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,
+            tensor_parallel_layers_axis_map=tensor_parallel_layers_axis_map,
             sharded_offsets=sharded_offsets,
             tp_group=tp_group,
             dp_cp_group=metadata['dp_cp_group'],
@@ -207,7 +209,12 @@ class GraphableMegatronModule(MegatronModule):
     def __init__(self, config: TransformerConfig, vp_stage: Optional[int] = None):
         super().__init__(config)
 
-        assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
+        # Dragon's DragonConfig is a sibling of TransformerConfig (both ModelParallelConfig)
+        from megatron.core.dragon.dragon_config import DragonConfig
+
+        assert isinstance(
+            config, (TransformerConfig, DragonConfig)
+        ), "config must be a TransformerConfig or a DragonConfig"
 
         # Enable cuda graphs.
         if config.cuda_graph_impl == "local":

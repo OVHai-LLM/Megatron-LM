@@ -25,7 +25,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
-from ..transformer.moe.moe_utils import get_updated_expert_bias
+from ..transformer.moe.moe_utils import get_updated_expert_bias, get_updated_expert_bias_pid
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
     get_attr_wrapped_model,
@@ -381,10 +381,12 @@ def _update_router_expert_bias(
 ):
     """
     Update the expert bias of the router for a global batch.
-    This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
+    This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks.
+    Supports both sign-based (default) and PID controller modes.
     """
     tokens_per_expert_list = []
     expert_bias_list = []
+    router_modules = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             # Only update expert_bias if this module is in the training mode. There are special
@@ -399,20 +401,55 @@ def _update_router_expert_bias(
             ):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
+                router_modules.append(module)
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
         return
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
-    stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert,
-        stacked_expert_bias,
-        config.moe_router_bias_update_rate,
-        tp_dp_cp_group=tp_dp_cp_group,
-    )
 
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
-        expert_bias.copy_(updated_expert_bias)
+    use_pid = getattr(config, 'moe_router_bias_use_pid', False)
+    if use_pid:
+        error_integral_list = [m.pid_error_integral for m in router_modules]
+        prev_error_list = [m.pid_prev_error for m in router_modules]
+        stacked_integral = torch.stack(error_integral_list, dim=0)
+        stacked_prev_error = torch.stack(prev_error_list, dim=0)
+
+        stacked_updated_bias, stacked_new_integral, stacked_new_error = (
+            get_updated_expert_bias_pid(
+                stacked_tokens_per_expert,
+                stacked_expert_bias,
+                stacked_integral,
+                stacked_prev_error,
+                kp=config.moe_router_bias_pid_kp,
+                ki=config.moe_router_bias_pid_ki,
+                kd=config.moe_router_bias_pid_kd,
+            )
+        )
+
+        for module, upd_bias, new_integral, new_error in zip(
+            router_modules, stacked_updated_bias, stacked_new_integral, stacked_new_error
+        ):
+            module.expert_bias.copy_(upd_bias)
+            module.pid_error_integral.copy_(new_integral)
+            module.pid_prev_error.copy_(new_error)
+    else:
+        stacked_updated_expert_bias = get_updated_expert_bias(
+            stacked_tokens_per_expert,
+            stacked_expert_bias,
+            config.moe_router_bias_update_rate,
+            tp_dp_cp_group=tp_dp_cp_group,
+        )
+        for expert_bias, updated_expert_bias in zip(
+            expert_bias_list, stacked_updated_expert_bias
+        ):
+            expert_bias.copy_(updated_expert_bias)
+
+    # Dragon (MoE balance logging, moe_utils): the TPxCPxDP-reduced token counts. Both update
+    # paths all-reduce stacked_tokens_per_expert in place, so reuse it instead of one extra
+    # all-reduce per router.
+    for module, global_tokens in zip(router_modules, stacked_tokens_per_expert):
+        module.local_tokens_per_expert2 = global_tokens
 
 
 def _update_router_qb_beta(
@@ -493,8 +530,11 @@ def _allreduce_non_tensor_model_parallel_grads(
                         grad = _unshard_if_dtensor(grad)
                         grads_avg.append(grad.data)
                 # Check if this param needs sum reduction (sequence parallel or qk_layernorm)
-                elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
-                    config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
+                # Dragon: params flagged tp_sync are replicated over TP and need summed grads too.
+                elif (
+                    (config.sequence_parallel and getattr(param, "sequence_parallel", False))
+                    or (config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name))
+                    or getattr(param, 'tp_sync', False)
                 ):
                     grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)

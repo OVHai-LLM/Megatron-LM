@@ -182,7 +182,10 @@ def initialize_runtime_services(
     """Initialize shared services, plus training-only services when requested."""
     if build_tokenizer:
         _build_tokenizer(args)
-    _set_wandb_writer(args)
+    # Dragon: when training, wandb is initialized later by training.pretrain (initialize_wandb), after the
+    # checkpoint is loaded, so that a resumed run can fork its wandb run (wandb_fork_from_id/step).
+    if not training:
+        _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
     if args.enable_experimental:
@@ -354,6 +357,13 @@ def _set_wandb_writer(args):
             'config': wandb_config}
         if cfg.logger.wandb_entity:
             wandb_kwargs['entity'] = cfg.logger.wandb_entity
+        fork_id = getattr(args, 'wandb_fork_from_id', None)
+        fork_step = getattr(args, 'wandb_fork_from_step', None)
+        if fork_id and fork_step is not None:
+            print(f"\n> forking wandb from {fork_id} at step {fork_step}")
+            wandb_kwargs['fork_from'] = f'{fork_id}?_step={fork_step-5}'
+        else:
+            print("\n> not forking wandb")
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
@@ -653,3 +663,8 @@ def destroy_global_vars():
 
     global _GLOBAL_TELEMETRY_HANDLE
     _GLOBAL_TELEMETRY_HANDLE = None
+
+
+def set_wandb_writer(args):
+    """Public entry point (Dragon): initialize the wandb writer once the checkpoint is loaded."""
+    _set_wandb_writer(args)

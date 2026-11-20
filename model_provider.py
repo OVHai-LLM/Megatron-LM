@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.dragon import DragonModel
 from megatron.training import get_args, print_rank_0
 from megatron.training.global_vars import get_run_config
 
@@ -20,7 +21,7 @@ except ImportError:
 
 def model_provider(
     model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
-) -> Union[GPTModel, HybridModel]:
+) -> Union[GPTModel, HybridModel, DragonModel]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.

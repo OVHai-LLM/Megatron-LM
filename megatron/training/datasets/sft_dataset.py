@@ -17,6 +17,13 @@ from megatron.training.datasets.utils import load_json_arg
 IGNORE_INDEX = -100
 
 
+def _pad_id(tokenizer) -> int:
+    """Pad id of Dragon's packs: the tokenizer's pad, else its EOD (Qwen tokenizers have no pad
+    under the nemotron prompt formats)."""
+    pad = tokenizer.pad
+    return pad if pad is not None else tokenizer.eod
+
+
 class SFTLowLevelDataset:
     """The low-level dataset loading jsonl data for SFT
 
@@ -47,8 +54,9 @@ class SFTLowLevelDataset:
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> list:
-        return self.dataset[idx]["messages"]
+    def __getitem__(self, idx: int) -> dict:
+        # Dragon: the whole record (packed pre-tokenized records have no "messages").
+        return self.dataset[idx]
 
 
 class SFTDataset(MegatronDataset):
@@ -113,12 +121,146 @@ class SFTDataset(MegatronDataset):
         # divisor = ((divisor + 15) // 16) * 16
         return divisor
 
+    def _getitem_packed(self, record, max_seq_len, L, tokenizer) -> Dict[str, Any]:
+        """Build a training sample from a pre-tokenized packed record.
+
+        record = {'input_ids', 'loss_mask', 'cu_seqlens', 'tokens_length'} where
+        cu_seqlens are document boundaries WITHIN the pack (in token units of the
+        unshifted sequence). We pad to L = max_seq_len + 1, causal-shift, build
+        per-document position_ids (reset at each boundary), and pass cu_seqlens +
+        max_seqlen through so get_batch can populate packed_seq_params and the
+        Mamba/attention kernels reset state per document.
+        """
+        ids  = list(record['input_ids'])
+        mask = list(record['loss_mask'])
+        cu   = list(record['cu_seqlens'])
+        num_tokens = int(record['tokens_length'])
+
+        # truncate to L (packer already bounds to <= max_seq_len, but be safe)
+        if len(ids) > L:
+            ids = ids[:L]; mask = mask[:L]
+            cu = [c for c in cu if c < L] + [L]
+        # pad to L
+        pad = L - len(ids)
+        if pad > 0:
+            ids  = ids  + [_pad_id(tokenizer)] * pad
+            mask = mask + [0.0] * pad
+
+        ids  = torch.as_tensor(ids,  dtype=torch.long)
+        mask = torch.as_tensor(mask, dtype=torch.float32)
+        # causal shift: ids has length L = max_seq_len + 1; tokens/labels/loss_mask
+        # are length max_seq_len. cu_seqlens (built on the unshifted ids in [0, L])
+        # must therefore be expressed in the SHIFTED model-input coordinate
+        # [0, max_seq_len] to match the pretraining contract (where cu_seqlens is
+        # computed on the already-shifted `tokens`). We map an unshifted boundary
+        # b (start of a document in `ids`) to the shifted index max(0, b-?)... in
+        # practice the shift drops index 0, so boundary b in ids maps to b in the
+        # labels frame; we clamp the final boundary to max_seq_len and dedup.
+        tokens    = ids[:-1].contiguous()
+        labels    = ids[1:].contiguous()
+        loss_mask = mask[1:].contiguous()
+
+        # Boundaries in the shifted (model-input) coordinate: clamp to max_seq_len
+        # and drop any degenerate (zero-length) segments after clamping.
+        cu_shift = []
+        for c in cu:
+            c = min(int(c), max_seq_len)
+            if not cu_shift or c != cu_shift[-1]:
+                cu_shift.append(c)
+        if cu_shift[0] != 0:
+            cu_shift = [0] + cu_shift
+        if cu_shift[-1] != max_seq_len:
+            cu_shift.append(max_seq_len)
+
+        # per-document position_ids: 0..len-1 within each packed doc (shifted frame)
+        position_ids = torch.zeros(max_seq_len, dtype=torch.long)
+        for a, b in zip(cu_shift[:-1], cu_shift[1:]):
+            if b > a:
+                position_ids[a:b] = torch.arange(b - a, dtype=torch.long)
+
+        cu_seqlens = torch.as_tensor(cu_shift, dtype=torch.int32)
+        seg = (cu_seqlens[1:] - cu_seqlens[:-1])
+        max_seqlen = torch.tensor(int(seg.max().item()) if seg.numel() else max_seq_len,
+                                  dtype=torch.int32)
+
+        ret = {
+            'tokens': tokens,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids,
+            'num_tokens': torch.tensor(num_tokens),
+            'cu_seqlens': cu_seqlens,
+            'max_seqlen': max_seqlen,
+        }
+        if self.config.create_attention_mask:
+            ret['attention_mask'] = None
+        return ret
+
+    def _getitem_dragon_conversation(self, record, max_seq_len, L, tokenizer) -> Dict[str, Any]:
+        """Dragon's unpacked path: one conversation {"messages", "tokens_length"[, "chat_template_kwargs"]},
+        loss mask from the HF chat template's assistant mask, no cu_seqlens (bucketed in get_batch)."""
+        conversation_list = record
+        num_tokens = conversation_list['tokens_length']
+        # library SFTTokenizer (megatron.core.tokenizers): (input_ids, assistant mask)
+        lib_tok = getattr(tokenizer, '_tokenizer', tokenizer)
+        tokens_conv, loss_mask = lib_tok.tokenize_sample(conversation_list)
+        # truncation
+        if len(tokens_conv) > L:
+            tokens_conv = tokens_conv[:L]
+            loss_mask = loss_mask[:L]
+        # padding
+        padding_len = L - len(tokens_conv)
+        if padding_len:
+            tokens_conv = np.array(list(tokens_conv) + [_pad_id(tokenizer)] * padding_len, dtype=np.int64)
+            loss_mask   = np.array(list(loss_mask)   + [0.]            * padding_len, dtype=np.float32)
+        else:
+            tokens_conv = np.array(tokens_conv, dtype=np.int64)
+            loss_mask   = np.array(loss_mask, dtype=np.float32)
+        # torch conversion
+        tokens_conv = torch.as_tensor(tokens_conv, dtype=torch.long)
+        loss_mask   = torch.as_tensor(loss_mask,   dtype=torch.float32)
+        # shift for causal lm
+        tokens       = tokens_conv[:-1].contiguous()
+        labels       = tokens_conv[1:].contiguous()
+        loss_mask    = loss_mask[1:].contiguous()
+        position_ids = torch.arange(max_seq_len, dtype=torch.long)
+
+        if self.config.create_attention_mask:
+            ret = {
+                'tokens': tokens,
+                'labels': labels,
+                'attention_mask': None,
+                'loss_mask': loss_mask,
+                'position_ids': position_ids,
+                'num_tokens': torch.tensor(num_tokens),
+            }
+        else:
+            ret = {
+                'tokens': tokens,
+                'labels': labels,
+                'loss_mask': loss_mask,
+                'position_ids': position_ids,
+                'num_tokens': torch.tensor(num_tokens),
+            }
+
+        return ret
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
         tokenizer = self.config.tokenizer
         pack_length = self.config.sequence_length
 
-        merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
+        record = self.dataset[int(self.indices[idx % len(self.indices)])]
+        # Dragon: pre-tokenized packs {"input_ids","loss_mask","cu_seqlens","tokens_length"} from
+        # the offline packer, and single conversations with "tokens_length".
+        if isinstance(record, dict) and 'input_ids' in record:
+            return self._getitem_packed(record, pack_length, pack_length + 1, tokenizer)
+        if isinstance(record, dict) and 'tokens_length' in record:
+            return self._getitem_dragon_conversation(
+                record, pack_length, pack_length + 1, tokenizer
+            )
+
+        merged_conversations = record["messages"] if isinstance(record, dict) else record
         split_conversations = self._split_conversations(merged_conversations)
 
         def extend_with_padding(tokens, targets, positions, pad_len):

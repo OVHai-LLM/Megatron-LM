@@ -1,8 +1,10 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import math
 from typing import Literal, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -130,6 +132,10 @@ class LanguageModelEmbedding(MegatronModule):
             embeddings = embeddings + tokentype_embedding
         else:
             assert self.tokentype_embeddings is None
+
+        # Dragon: L2-normalize the embeddings (--normalize-embeddings)
+        if getattr(self.config, 'normalize_embeddings', False):
+            embeddings = F.normalize(embeddings, dim=-1)
 
         # MuP: scale embeddings by alpha_input.
         if self.config.use_mup and self.config.mup_embedding_mult != 1.0:

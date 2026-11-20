@@ -3,9 +3,10 @@
 import json
 import logging
 from typing import List, Optional
+from pathlib import Path
 
 try:
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
     from transformers.utils import cached_file
 
     HAVE_TRANSFORMERS = True
@@ -106,11 +107,19 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         try:
             # this logic deals with different huggingface tokenizers having different args
             if vocab_file is None:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path=tokenizer_path,
-                    use_fast=use_fast,
-                    trust_remote_code=trust_remote_code,
-                )
+                if tokenizer_path.endswith(".json"):
+                    # Dragon: a tokenizer_config.json / tokenizer.json path -> its directory
+                    self.tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                        Path(tokenizer_path).parent
+                    )
+                    # legacy _HuggingFacePretrainedTokenizer's EOD: <|endoftext|> (Qwen), not eos
+                    self._eod_override = self.tokenizer.convert_tokens_to_ids("<|endoftext|>")
+                else:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        pretrained_model_name_or_path=tokenizer_path,
+                        use_fast=use_fast,
+                        trust_remote_code=trust_remote_code,
+                    )
             elif merges_file is None:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     pretrained_model_name_or_path=tokenizer_path,
@@ -401,6 +410,8 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
     @property
     def eod(self) -> int:
         """Returns EOD token id."""
+        if getattr(self, '_eod_override', None) is not None:
+            return self._eod_override
         if getattr(self, 'eos_token') is None:
             return None
         return self.tokens_to_ids([getattr(self, 'eos_token')])[0]
