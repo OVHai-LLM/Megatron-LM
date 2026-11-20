@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 import math
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
@@ -56,6 +57,38 @@ try:
 except Exception:
     import logging as _logging
     _logging.getLogger("tilelang").setLevel(_logging.ERROR)
+
+
+_M3_PATH_REPORTED = False
+
+
+def _check_mamba3_sm100_path(q, k, v, mimo_out, z, D, angles, chunk_size, rotary_dim_divisor, dtype, cu_seqlens):
+    """Report (once) whether mamba3_mimo will take the OVHai sm100 tcgen05 kernels or fall back to TileLang.
+
+    The decision is mamba_ssm's own (sm100.common.config_ok, same arguments as mamba3_mimo passes it). With
+    DRAGON_REQUIRE_FAST_KERNELS=1 a fallback raises instead of silently running ~several x slower."""
+    global _M3_PATH_REPORTED
+    require = os.environ.get("DRAGON_REQUIRE_FAST_KERNELS", "0") == "1"
+    if _M3_PATH_REPORTED and not require:
+        return
+    try:
+        from mamba_ssm.ops.cuda.mamba3.sm100 import common as _sm100
+        cu = None if cu_seqlens is None else cu_seqlens.to(torch.int32)
+        ok = bool(_sm100.config_ok(q, k, v, v.shape[2], mimo_out, z, D, angles, chunk_size, rotary_dim_divisor,
+                                   dtype, False, cu, False))
+        why = "" if ok else (
+            f"enabled={_sm100.enabled()} cu_seqlens={'set' if cu is not None else 'None'} q={tuple(q.shape)} "
+            f"v={tuple(v.shape)} angles={tuple(angles.shape)} rotary_dim_divisor={rotary_dim_divisor} "
+            f"dtypes q/k/v/z={q.dtype}/{k.dtype}/{v.dtype}/{z.dtype}")
+    except Exception as e:  # pragma: no cover
+        ok, why = False, f"mamba_ssm sm100 module unavailable: {e}"
+    if not _M3_PATH_REPORTED:
+        _M3_PATH_REPORTED = True
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(f"[dragon] Mamba-3 MIMO kernels: {'OVHai sm100 tcgen05' if ok else 'TileLang fallback (' + why + ')'}",
+                  flush=True)
+    if require and not ok:
+        raise RuntimeError(f"DRAGON_REQUIRE_FAST_KERNELS=1 but Mamba-3 would use the TileLang fallback: {why}")
 
 
 def _canon_strides(t):
@@ -443,6 +476,8 @@ class FastMamba3(MegatronModule):
             f"(got batch={b_size}); pack sequences instead of batching."
         )
 
+        _check_mamba3_sm100_path(C, B, x, self.out_proj_mimo, z, self.D, angle, self.chunk_size,
+                                 self.rotary_dim_divisor, x.dtype, cu_seqlens)
         y = mamba3_mimo(
             Q=_canon_strides(C),
             K=_canon_strides(B),

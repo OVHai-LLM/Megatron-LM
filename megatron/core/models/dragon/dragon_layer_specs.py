@@ -1,3 +1,4 @@
+import os
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
@@ -75,6 +76,9 @@ def get_dragon_block_spec(
     pp_rank: Optional[int] = None,
 ):
     backend = TESpecProvider()
+    if os.environ.get("DRAGON_REQUIRE_FAST_KERNELS", "0") == "1" and config.dragon_core_attention != "fa4":
+        raise RuntimeError("DRAGON_REQUIRE_FAST_KERNELS=1 needs --dragon-core-attention fa4 (TE disables its "
+                           "cuDNN/FA4 backends under softcap: on Blackwell it would fall back to FlashAttention 2)")
     if config.dragon_core_attention == "fa4":
         from megatron.core.dragon.dragon_fa4_attention import FA4DotProductAttention as core_attention
     else:

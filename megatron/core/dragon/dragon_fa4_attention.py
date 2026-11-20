@@ -32,6 +32,7 @@ except ImportError:
     flash_attn_func = flash_attn_varlen_func = None
     HAVE_FA4 = False
 
+_FA4_REPORTED = False
 _CAUSAL = (AttnMaskType.causal, AttnMaskType.padding_causal)
 _NON_CAUSAL = (AttnMaskType.no_mask, AttnMaskType.padding)
 
@@ -115,6 +116,13 @@ class FA4DotProductAttention(MegatronModule):
         if window_size is None:
             window_size = self.window_size
         common = dict(softmax_scale=self.softmax_scale, causal=causal, softcap=self.softcap)
+        global _FA4_REPORTED
+        if not _FA4_REPORTED:
+            _FA4_REPORTED = True
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                import flash_attn.cute as _fa4
+                print(f"[dragon] attention: FlashAttention-4 (CuTe-DSL) from {_fa4.__file__}, softcap={self.softcap}, "
+                      f"{'varlen thd' if packed_seq_params is not None else 'sbhd'}", flush=True)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             # (t, h, d): the documents of a pack, cu_seqlens their boundaries
