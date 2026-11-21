@@ -847,14 +847,5 @@ class DragonModel(LanguageModule):
         """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
-        # Multi-Token Prediction (MTP) need embedding layer in mtp process stage.
-        # If MTP is not placed in the pre processing stage, we need to maintain a copy of
-        # embedding layer in the mtp process stage and tie it to the embedding in the pre
-        # processing stage.
-        # Now MTP loss is computed in post processing stage, so the output_layer is not needed.
-        if self.mtp_process and not self.pre_process:
-            emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
-            emb_weight = self.embedding.word_embeddings.weight
-            tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, emb_weight_key)
-
+        # MTP embedding tying (mtp_process and not pre_process) is done by LanguageModule.sharded_state_dict
         return sharded_state_dict
