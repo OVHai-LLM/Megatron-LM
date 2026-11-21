@@ -701,7 +701,8 @@ class DragonModel(LanguageModule):
             and not in_inference_mode
             and not self.config.normalize_lm_head
             and self.config.mtp_num_layers is None
-            and self.output_layer.sequence_parallel
+            # sequence-parallel head, or TP=1 (gather/reduce-scatter over one rank are copies)
+            and (self.output_layer.sequence_parallel or self.pg_collection.tp.size() == 1)
         ):
             # Loss without the [S, V/TP] logits (QuACK chunked LCE, sequence-parallel head).
             return sequence_parallel_chunked_lce(
