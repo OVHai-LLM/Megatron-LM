@@ -705,6 +705,11 @@ class DragonModel(LanguageModule):
             and (self.output_layer.sequence_parallel or self.pg_collection.tp.size() == 1)
         ):
             # Loss without the [S, V/TP] logits (QuACK chunked LCE, sequence-parallel head).
+            # The output weight is read directly, not through output_layer(...): run the module's
+            # forward pre-hooks ourselves, or DDP's --overlap-param-gather never waits for (nor
+            # chains past) this weight's all-gather (stale weight, dangling handle next iteration).
+            for _hook in self.output_layer._forward_pre_hooks.values():
+                _hook(self.output_layer, (hidden_states,))
             return sequence_parallel_chunked_lce(
                 hidden_states,
                 self.output_layer.weight,
