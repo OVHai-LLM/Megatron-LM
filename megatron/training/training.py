@@ -3092,6 +3092,11 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
         kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
+        # TE delays the expert wgrad for overlap_dispatch_backward_with_experts_wgrad too (it returns
+        # a dummy grad in backward): the DDP grad-ready hook must then fire from backward_dw, not from
+        # AccumulateGrad, or the bucket reduce could start before the delayed wgrad is written.
+        kwargs["delay_wgrad_compute"] = bool(getattr(args, "delay_wgrad_compute", False)) or bool(
+            getattr(args, "overlap_dispatch_backward_with_experts_wgrad", False))
         kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
         kwargs["check_for_large_grads"] = args.check_for_large_grads
         kwargs["num_buckets"] = args.ddp_num_buckets
