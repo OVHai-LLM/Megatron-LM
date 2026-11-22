@@ -1267,6 +1267,7 @@ class DragonConfig(TransformerConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
+                "mixer_proj",  # input of the mixer output projection (DragonLayer, every layer)
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
