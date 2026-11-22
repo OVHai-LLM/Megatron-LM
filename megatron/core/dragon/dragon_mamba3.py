@@ -570,7 +570,9 @@ class FastMamba3(MegatronModule):
         # fp32 before the head broadcast: one materialized copy instead of two (bf16 expand, then fp32 cast);
         # the backward sums the head gradients in fp32 before the bf16 cast
         angle = angle.transpose(0, 1).to(torch.float32) # (B, L, S)
-        angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1).contiguous() # (B, L, H, S)
+        # broadcast over the heads as a view: mamba_ssm's sm100 kernels read it in place (older mamba_ssm, or
+        # the TileLang path, materialize it with .contiguous() as before)
+        angle = angle.contiguous().unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, H, S)
 
         ADT = rearrange(ADT, "b l n -> b n l")
         dt = rearrange(dt, "b l n -> b n l")
@@ -608,7 +610,7 @@ class FastMamba3(MegatronModule):
             MIMO_V=self.in_proj_mimo_x.to(torch.float32),
             MIMO_Z=self.in_proj_mimo_z.to(torch.float32),
             MIMO_Out=self.out_proj_mimo.to(torch.float32),
-            Angles=_canon_strides(angle.to(torch.float32)),
+            Angles=angle,
             D=self.D.to(torch.float32).contiguous(),
             Z=_canon_strides(z),
             chunk_size=self.chunk_size,
