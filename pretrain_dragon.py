@@ -519,7 +519,7 @@ def get_embedding_ranks(pp_ranks: List[int]):
         args = get_args()
         if not args.untie_embeddings_and_output_weights:
             embedding_ranks.append(pp_ranks[-1])
-        config = core_transformer_config_from_args(args)
+        config = _dragon_config(args)
         mtp_ranks = get_mtp_ranks(pp_ranks, config)
         embedding_ranks.extend(mtp_ranks)
     embedding_ranks = list(set(embedding_ranks))
