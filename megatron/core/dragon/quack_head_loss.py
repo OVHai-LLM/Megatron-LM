@@ -19,6 +19,14 @@ dW is exact when the per-token loss gradient is the same for every non-masked to
 Megatron's loss (sum(loss * mask) / num_tokens, times a global scale) produces: tokens with
 loss_mask == 0 are given ignore_index in the forward so they contribute nothing. Set
 DRAGON_QUACK_LCE_CHECK=1 to verify that assumption at every backward (host sync).
+
+Softmax collapse (Barron et al. 2026): QuACK's row kernel forms the target gradient as p_t - 1 and the
+loss as lse - z_t. For a target margin m = z_t - logsumexp_{j!=t} z_j above ~16.6 nats (fp32), p_t
+rounds to 1, so the target gradient is exactly 0 while the non-target gradients p_j stay nonzero (the
+row no longer sums to 0, and the whole logit gradient of the token points the wrong way), and the loss
+rounds to 0. With DRAGON_LCE_ZERO_SUM=1 (default) each dlogits chunk gets its target column rewritten
+as -sum_{j!=t} p_j (fp32 row sum of the bf16 dlogits) and, where the kernel's loss is < 1e-4, the loss
+as -log1p(-sum_{j!=t} p_j): one extra read of the chunk (~0.1% of an SFT iteration).
 """
 
 import os
@@ -31,7 +39,7 @@ from torch import Tensor
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
 try:
-    from quack.cross_entropy import cross_entropy_fwd_out  # noqa: F401  (import check)
+    from quack.cross_entropy import cross_entropy_fwd_out
     from quack.gemm_interface import gemm, gemm_add_inplace
     from quack.linear_cross_entropy import chunked_linear_cross_entropy_fwd
 
@@ -40,6 +48,56 @@ except ImportError:  # pragma: no cover
     HAVE_QUACK = False
 
 IGNORE_INDEX = -100
+ZERO_SUM_FIX = os.environ.get("DRAGON_LCE_ZERO_SUM", "1") == "1"
+_SMALL_LOSS = 1e-4
+
+
+def _fix_target_column_(dlogits: Tensor, target: Tensor, loss: Tensor, ignore_index: int) -> None:
+    """In place: dlogits[r, t_r] = -sum_{j != t_r} dlogits[r, j] (fp32 accumulation), and the loss of
+    rows whose kernel loss is < 1e-4 as -log1p(-sum_{j != t} p_j) (the kernel's lse - z_t is 0 there
+    once the margin exceeds ~16.6 nats). Ignored rows (all-zero dlogits) are left untouched."""
+    valid = target != ignore_index
+    tsafe = torch.where(valid, target, torch.zeros_like(target))
+    rows = torch.arange(dlogits.shape[0], device=dlogits.device)
+    g_t = dlogits[rows, tsafe].float()
+    s_nt = torch.sum(dlogits, dim=1, dtype=torch.float32) - g_t
+    dlogits[rows, tsafe] = torch.where(valid, -s_nt, g_t).to(dlogits.dtype)
+    small = valid & (loss < _SMALL_LOSS)
+    loss.copy_(torch.where(small, -torch.log1p(-s_nt.clamp(max=0.5)), loss))
+
+
+def _chunked_lce_fwd_zero_sum(x, weight, target, chunk_size, ignore_index, tuned=True, need_dx=True,
+                              need_dw=True):
+    """quack.linear_cross_entropy.chunked_linear_cross_entropy_fwd (same outputs) with the target column of
+    every dlogits chunk corrected by _fix_target_column_ before it enters the dx / dW GEMMs."""
+    if not (need_dx or need_dw):
+        return chunked_linear_cross_entropy_fwd(x, weight, target, chunk_size, ignore_index, tuned=tuned,
+                                                need_dx=False, need_dw=False)
+    BL, V = x.shape[0], weight.shape[0]
+    loss = torch.empty(BL, device=x.device, dtype=torch.float32)
+    logits_buf = torch.empty((min(chunk_size, BL), V), device=x.device, dtype=x.dtype)
+    dx = torch.empty_like(x) if need_dx else None
+    num_chunks = (BL + chunk_size - 1) // chunk_size
+    dw = torch.empty_like(weight, dtype=torch.float32) if need_dw and num_chunks > 1 else None
+    last_dlogits = last_x = None
+    for i, start in enumerate(range(0, BL, chunk_size)):
+        end = min(start + chunk_size, BL)
+        x_c, t_c = x[start:end], target[start:end]
+        dl = logits_buf[: end - start]
+        torch.mm(x_c, weight.mT, out=dl)                     # logits, overwritten by dlogits below
+        cross_entropy_fwd_out(dl, t_c, None, loss[start:end], None, dl, None, ignore_index)
+        _fix_target_column_(dl, t_c, loss[start:end], ignore_index)
+        if need_dx:
+            torch.mm(dl, weight, out=dx[start:end])
+        if not need_dw:
+            continue
+        if i == num_chunks - 1:
+            last_dlogits, last_x = dl, x_c                   # dW of the last chunk is finished in backward
+        elif i == 0:
+            gemm(dl.T, x_c, out=dw, tuned=tuned)
+        else:
+            gemm_add_inplace(dl.T, x_c, dw, tuned=tuned)
+    return loss, dx, dw, last_dlogits, last_x
 
 
 def _all_gather_dim0(t: Tensor, group) -> Tensor:
@@ -65,7 +123,8 @@ class _SeqParallelChunkedLCE(torch.autograd.Function):
         # (grad mode is off inside forward; needs_input_grad says what backward will want)
         need_dx, need_dw = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
         w_full = _all_gather_dim0(weight_shard.to(x.dtype), tp_group)  # [V, h]
-        loss, dx, dw, last_dlogits, last_x = chunked_linear_cross_entropy_fwd(
+        fwd = _chunked_lce_fwd_zero_sum if ZERO_SUM_FIX else chunked_linear_cross_entropy_fwd
+        loss, dx, dw, last_dlogits, last_x = fwd(
             x, w_full, target, chunk_size, IGNORE_INDEX, tuned=True, need_dx=need_dx, need_dw=need_dw)
         del w_full
         ctx.save_for_backward(dx, dw, last_dlogits, last_x, target, weight_shard)

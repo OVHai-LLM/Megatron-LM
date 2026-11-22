@@ -47,18 +47,18 @@ def calculate_predicted_logits(
 @jit_fuser
 def calculate_cross_entropy_loss(
     exp_logits: torch.Tensor, predicted_logits_sum_exp_logits: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Calculates the final cross entropy loss for the tokens.
+    Calculates the final cross entropy loss for the tokens (and the target-class gradient).
     """
     split_val = predicted_logits_sum_exp_logits.size()[0] // 2
     predicted_logits, sum_exp_logits = torch.split(predicted_logits_sum_exp_logits, split_val)
 
-    exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
+    exp_logits, loss, target_grad = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
         exp_logits, predicted_logits, sum_exp_logits
     )
 
-    return exp_logits, loss
+    return exp_logits, loss, target_grad
 
 
 @jit_fuser
@@ -67,6 +67,7 @@ def calculate_gradients(
     grad_output: torch.Tensor,
     target_mask: torch.Tensor,
     masked_target_1d: torch.Tensor,
+    target_grad: torch.Tensor,
     logits_dtype: torch.dtype,
 ) -> torch.Tensor:
     """
@@ -77,7 +78,7 @@ def calculate_gradients(
     )
 
     grad_input = VocabParallelCrossEntropy.calculate_gradients(
-        grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
+        grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output, target_grad
     )
 
     # Emit the gradient in the dtype of the forward logits. If it differed, the autograd
@@ -120,10 +121,12 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             predicted_logits_sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
 
-        exp_logits, loss = calculate_cross_entropy_loss(exp_logits, predicted_logits_sum_exp_logits)
+        exp_logits, loss, target_grad = calculate_cross_entropy_loss(
+            exp_logits, predicted_logits_sum_exp_logits
+        )
 
-        # Store softmax, target-mask and masked-target for backward pass.
-        ctx.save_for_backward(exp_logits, target_mask, masked_target_1d)
+        # Store softmax, target-mask, masked-target and the target gradient for backward pass.
+        ctx.save_for_backward(exp_logits, target_mask, masked_target_1d, target_grad)
 
         return loss
 
@@ -133,10 +136,10 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         Backward implementation for the cross entropy loss.
         """
         # Retreive tensors from the forward path.
-        softmax, target_mask, masked_target_1d = ctx.saved_tensors
+        softmax, target_mask, masked_target_1d, target_grad = ctx.saved_tensors
 
         grad_input = calculate_gradients(
-            softmax, grad_output, target_mask, masked_target_1d, ctx.logits_dtype
+            softmax, grad_output, target_mask, masked_target_1d, target_grad, ctx.logits_dtype
         )
 
         return grad_input, None, None
