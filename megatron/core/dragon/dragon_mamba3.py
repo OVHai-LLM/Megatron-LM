@@ -175,7 +175,7 @@ try:
 except ImportError:  # pragma: no cover
     _HAVE_TRITON_SPLIT = False
 
-_SPLIT_BT, _SPLIT_HB = 4, 16
+_SPLIT_BT, _SPLIT_NW = 1, 2  # GB300, H=48, 64k tokens: fwd 0.31 ms, bwd 0.39 ms (4 x 16 heads: 0.32 / 0.48)
 
 
 class _SplitZXDtATrap(torch.autograd.Function):
@@ -196,9 +196,10 @@ class _SplitZXDtATrap(torch.autograd.Function):
             dt = torch.empty((B, H, L), dtype=dt_, device=dev)
             A = torch.empty_like(dt)
             trap = torch.empty((B, H, L), dtype=dt_, device=dev)
-            grid = (triton.cdiv(L, _SPLIT_BT), triton.cdiv(H, _SPLIT_HB))
-            _split_zx_fwd_kernel[grid](per_head, z, x, dt, A, trap, L, H, P=P, BT=_SPLIT_BT, HB=_SPLIT_HB,
-                                       num_warps=4)
+            HB = min(64, triton.next_power_of_2(H))
+            grid = (triton.cdiv(L, _SPLIT_BT), triton.cdiv(H, HB))
+            _split_zx_fwd_kernel[grid](per_head, z, x, dt, A, trap, L, H, P=P, BT=_SPLIT_BT, HB=HB,
+                                       num_warps=_SPLIT_NW)
         else:
             z.copy_(per_head[..., :P].transpose(0, 1))
             x.copy_(per_head[..., P:2 * P].transpose(0, 1))
@@ -217,10 +218,11 @@ class _SplitZXDtATrap(torch.autograd.Function):
         if _HAVE_TRITON_SPLIT and B == 1 and dev.type == "cuda" and (P & (P - 1)) == 0:
             fill = lambda t, shape: (torch.zeros(shape, dtype=dty, device=dev) if t is None  # noqa: E731
                                      else t.to(dty).contiguous())
-            grid = (triton.cdiv(L, _SPLIT_BT), triton.cdiv(H, _SPLIT_HB))
+            HB = min(64, triton.next_power_of_2(H))
+            grid = (triton.cdiv(L, _SPLIT_BT), triton.cdiv(H, HB))
             _split_zx_bwd_kernel[grid](g, fill(dz, (B, L, H, P)), fill(dx, (B, L, H, P)), fill(ddt, (B, H, L)),
                                        fill(dA, (B, H, L)), fill(dtrap, (B, H, L)), L, H, P=P, BT=_SPLIT_BT,
-                                       HB=_SPLIT_HB, num_warps=4)
+                                       HB=HB, num_warps=_SPLIT_NW)
             return g, None
         for t, sl, perm in ((dz, slice(0, P), (1, 0, 2, 3)), (dx, slice(P, 2 * P), (1, 0, 2, 3)),
                             (ddt, 2 * P, (2, 0, 1)), (dA, 2 * P + 1, (2, 0, 1)), (dtrap, 2 * P + 2, (2, 0, 1))):
