@@ -91,6 +91,27 @@ def _check_mamba3_sm100_path(q, k, v, mimo_out, z, D, angles, chunk_size, rotary
         raise RuntimeError(f"DRAGON_REQUIRE_FAST_KERNELS=1 but Mamba-3 would use the TileLang fallback: {why}")
 
 
+def _canon_shape_strides(shape):
+    strides, acc = [], 1
+    for s in reversed(shape):
+        strides.append(acc)
+        acc *= s
+    return tuple(reversed(strides))
+
+
+class _CanonView(torch.autograd.Function):
+    """as_strided to the canonical strides of an already contiguous tensor, with an identity backward
+    (autograd's AsStridedBackward would zero-fill and scatter the whole storage)."""
+
+    @staticmethod
+    def forward(ctx, t):
+        return t.as_strided(t.shape, _canon_shape_strides(t.shape))
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
 def _canon_strides(t):
     """Force canonical C-contiguous strides.
 
@@ -100,12 +121,115 @@ def _canon_strides(t):
     batch size 1 (the cu_seqlens / B=1 case). as_strided fixes it without a copy.
     """
     t = t.contiguous()
-    shape = t.shape
-    strides, acc = [], 1
-    for s in reversed(shape):
-        strides.append(acc)
-        acc *= s
-    return t.as_strided(shape, tuple(reversed(strides)))
+    canon = _canon_shape_strides(t.shape)
+    if tuple(t.stride()) == canon:
+        return t
+    if not t.requires_grad:
+        return t.as_strided(t.shape, canon)
+    return _CanonView.apply(t)
+
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _split_zx_fwd_kernel(IN, Z, X, DT, A, TRAP, S, H, P: tl.constexpr, BT: tl.constexpr, HB: tl.constexpr):
+        t = tl.program_id(0) * BT + tl.arange(0, BT)[:, None, None]
+        h = tl.program_id(1) * HB + tl.arange(0, HB)[None, :, None]
+        j = tl.arange(0, P)[None, None, :]
+        m = (t < S) & (h < H)
+        W = 2 * P + 3
+        src = IN + (t.to(tl.int64) * H + h) * W
+        dst = (t.to(tl.int64) * H + h) * P + j
+        tl.store(Z + dst, tl.load(src + j, mask=m), mask=m)
+        tl.store(X + dst, tl.load(src + P + j, mask=m), mask=m)
+        t2 = tl.reshape(t, (BT, 1))
+        h2 = tl.reshape(h, (1, HB))
+        m2 = (t2 < S) & (h2 < H)
+        src2 = IN + (t2.to(tl.int64) * H + h2) * W + 2 * P
+        tl.store(DT + t2 * H + h2, tl.load(src2, mask=m2), mask=m2)
+        tl.store(A + t2 * H + h2, tl.load(src2 + 1, mask=m2), mask=m2)
+        tl.store(TRAP + h2.to(tl.int64) * S + t2, tl.load(src2 + 2, mask=m2), mask=m2)
+
+    @triton.jit
+    def _split_zx_bwd_kernel(G, DZ, DX, DDT, DA, DTRAP, S, H, P: tl.constexpr, BT: tl.constexpr, HB: tl.constexpr):
+        t = tl.program_id(0) * BT + tl.arange(0, BT)[:, None, None]
+        h = tl.program_id(1) * HB + tl.arange(0, HB)[None, :, None]
+        j = tl.arange(0, P)[None, None, :]
+        m = (t < S) & (h < H)
+        W = 2 * P + 3
+        dst = G + (t.to(tl.int64) * H + h) * W
+        src = (t.to(tl.int64) * H + h) * P + j
+        tl.store(dst + j, tl.load(DZ + src, mask=m), mask=m)
+        tl.store(dst + P + j, tl.load(DX + src, mask=m), mask=m)
+        t2 = tl.reshape(t, (BT, 1))
+        h2 = tl.reshape(h, (1, HB))
+        m2 = (t2 < S) & (h2 < H)
+        dst2 = G + (t2.to(tl.int64) * H + h2) * W + 2 * P
+        tl.store(dst2, tl.load(DDT + t2 * H + h2, mask=m2), mask=m2)
+        tl.store(dst2 + 1, tl.load(DA + t2 * H + h2, mask=m2), mask=m2)
+        tl.store(dst2 + 2, tl.load(DTRAP + h2.to(tl.int64) * S + t2, mask=m2), mask=m2)
+
+    _HAVE_TRITON_SPLIT = True
+except ImportError:  # pragma: no cover
+    _HAVE_TRITON_SPLIT = False
+
+_SPLIT_BT, _SPLIT_HB = 4, 16
+
+
+class _SplitZXDtATrap(torch.autograd.Function):
+    """Splits the per-head in_proj output (L, B=1, H, 2P + 3) into contiguous z, x (1, L, H, P), dt, A (1, L, H)
+    and trap (1, H, L) in one pass. Backward assembles the input gradient in one pass instead of five zero-filled
+    slice / select gradients summed by autograd (same values: those sums only add zeros)."""
+
+    @staticmethod
+    def forward(ctx, per_head, P):
+        ctx.P = P
+        ctx.shape = per_head.shape
+        L, B, H, W = per_head.shape
+        assert W == 2 * P + 3
+        dev, dt_ = per_head.device, per_head.dtype
+        z = torch.empty((B, L, H, P), dtype=dt_, device=dev)
+        x = torch.empty_like(z)
+        if _HAVE_TRITON_SPLIT and B == 1 and per_head.is_contiguous() and per_head.is_cuda and (P & (P - 1)) == 0:
+            dt = torch.empty((B, L, H), dtype=dt_, device=dev)
+            A = torch.empty_like(dt)
+            trap = torch.empty((B, H, L), dtype=dt_, device=dev)
+            grid = (triton.cdiv(L, _SPLIT_BT), triton.cdiv(H, _SPLIT_HB))
+            _split_zx_fwd_kernel[grid](per_head, z, x, dt, A, trap, L, H, P=P, BT=_SPLIT_BT, HB=_SPLIT_HB,
+                                       num_warps=4)
+        else:
+            z.copy_(per_head[..., :P].transpose(0, 1))
+            x.copy_(per_head[..., P:2 * P].transpose(0, 1))
+            dt = per_head[..., 2 * P].transpose(0, 1).contiguous()
+            A = per_head[..., 2 * P + 1].transpose(0, 1).contiguous()
+            trap = per_head[..., 2 * P + 2].permute(1, 2, 0).contiguous()
+        return z, x, dt, A, trap
+
+    @staticmethod
+    def backward(ctx, dz, dx, ddt, dA, dtrap):
+        P = ctx.P
+        L, B, H, W = ctx.shape
+        ref = next(t for t in (dz, dx, ddt, dA, dtrap) if t is not None)
+        dev, dty = ref.device, ref.dtype
+        g = torch.empty((L, B, H, W), dtype=dty, device=dev)
+        if _HAVE_TRITON_SPLIT and B == 1 and dev.type == "cuda" and (P & (P - 1)) == 0:
+            fill = lambda t, shape: (torch.zeros(shape, dtype=dty, device=dev) if t is None  # noqa: E731
+                                     else t.to(dty).contiguous())
+            grid = (triton.cdiv(L, _SPLIT_BT), triton.cdiv(H, _SPLIT_HB))
+            _split_zx_bwd_kernel[grid](g, fill(dz, (B, L, H, P)), fill(dx, (B, L, H, P)), fill(ddt, (B, L, H)),
+                                       fill(dA, (B, L, H)), fill(dtrap, (B, H, L)), L, H, P=P, BT=_SPLIT_BT,
+                                       HB=_SPLIT_HB, num_warps=4)
+            return g, None
+        for t, sl, perm in ((dz, slice(0, P), (1, 0, 2, 3)), (dx, slice(P, 2 * P), (1, 0, 2, 3)),
+                            (ddt, 2 * P, (1, 0, 2)), (dA, 2 * P + 1, (1, 0, 2)), (dtrap, 2 * P + 2, (2, 0, 1))):
+            dst = g[..., sl]
+            if t is None:
+                dst.zero_()
+            else:
+                dst.copy_(t.permute(*perm))
+        return g, None
 
 
 class _CanonGradStrides(torch.autograd.Function):
@@ -411,17 +535,9 @@ class FastMamba3(MegatronModule):
         # (built below), NOT by folding windows into the batch dim. The kernel runs
         # at B=1 with the full sequence; the static-shape patch keeps it fast.
         per_head = zxdtAtrap.view(*zxdtAtrap.shape[:-1], self.nheads_local_tp, 2*self.headdim+3)
-        off = 0
-        z    = per_head[..., off : off + self.headdim];   off += self.headdim # (L, B, H, p)
-        x    = per_head[..., off : off + self.headdim];   off += self.headdim # (L, B, H, p)
-        dt   = per_head[..., off];                        off += 1           # (L, B, H)
-        A    = per_head[..., off];                        off += 1           # (L, B, H)
-        trap = per_head[..., off];                        off += 1           # (L, B, H)
-        z = rearrange(z, "l b H p -> b l H p")
-        x = rearrange(x, "l b H p -> b l H p")
-        dt   = rearrange(dt, "l b n -> b l n").to(torch.float32)
-        A    = rearrange(A, "l b n -> b l n")
-        trap = rearrange(trap, "l b n -> b n l")
+        # z, x: (B, L, H, p) contiguous; dt, A: (B, L, H); trap: (B, H, L)
+        z, x, dt, A, trap = _SplitZXDtATrap.apply(per_head, self.headdim)
+        dt = dt.to(torch.float32)
 
         off = 0
         B     = BCangle[..., off : off + self.ngroups*self.mimo_dim*self.d_state]; off += self.ngroups*self.mimo_dim*self.d_state
@@ -451,7 +567,9 @@ class FastMamba3(MegatronModule):
 
         # Public kernel applies the angle cumsum internally (varlen-aware), so we
         # pass RAW angles (no external angle_dt).
-        angle = angle.transpose(0, 1) # (B, L, S)
+        # fp32 before the head broadcast: one materialized copy instead of two (bf16 expand, then fp32 cast);
+        # the backward sums the head gradients in fp32 before the bf16 cast
+        angle = angle.transpose(0, 1).to(torch.float32) # (B, L, S)
         angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1).contiguous() # (B, L, H, S)
 
         ADT = rearrange(ADT, "b l n -> b n l")
