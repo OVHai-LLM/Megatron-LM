@@ -148,8 +148,8 @@ try:
         h2 = tl.reshape(h, (1, HB))
         m2 = (t2 < S) & (h2 < H)
         src2 = IN + (t2.to(tl.int64) * H + h2) * W + 2 * P
-        tl.store(DT + t2 * H + h2, tl.load(src2, mask=m2), mask=m2)
-        tl.store(A + t2 * H + h2, tl.load(src2 + 1, mask=m2), mask=m2)
+        tl.store(DT + h2.to(tl.int64) * S + t2, tl.load(src2, mask=m2), mask=m2)
+        tl.store(A + h2.to(tl.int64) * S + t2, tl.load(src2 + 1, mask=m2), mask=m2)
         tl.store(TRAP + h2.to(tl.int64) * S + t2, tl.load(src2 + 2, mask=m2), mask=m2)
 
     @triton.jit
@@ -167,8 +167,8 @@ try:
         h2 = tl.reshape(h, (1, HB))
         m2 = (t2 < S) & (h2 < H)
         dst2 = G + (t2.to(tl.int64) * H + h2) * W + 2 * P
-        tl.store(dst2, tl.load(DDT + t2 * H + h2, mask=m2), mask=m2)
-        tl.store(dst2 + 1, tl.load(DA + t2 * H + h2, mask=m2), mask=m2)
+        tl.store(dst2, tl.load(DDT + h2.to(tl.int64) * S + t2, mask=m2), mask=m2)
+        tl.store(dst2 + 1, tl.load(DA + h2.to(tl.int64) * S + t2, mask=m2), mask=m2)
         tl.store(dst2 + 2, tl.load(DTRAP + h2.to(tl.int64) * S + t2, mask=m2), mask=m2)
 
     _HAVE_TRITON_SPLIT = True
@@ -179,8 +179,8 @@ _SPLIT_BT, _SPLIT_HB = 4, 16
 
 
 class _SplitZXDtATrap(torch.autograd.Function):
-    """Splits the per-head in_proj output (L, B=1, H, 2P + 3) into contiguous z, x (1, L, H, P), dt, A (1, L, H)
-    and trap (1, H, L) in one pass. Backward assembles the input gradient in one pass instead of five zero-filled
+    """Splits the per-head in_proj output (L, B=1, H, 2P + 3) into contiguous z, x (1, L, H, P), dt, A
+    and trap, all (1, H, L), in one pass. Backward assembles the input gradient in one pass instead of five zero-filled
     slice / select gradients summed by autograd (same values: those sums only add zeros)."""
 
     @staticmethod
@@ -193,7 +193,7 @@ class _SplitZXDtATrap(torch.autograd.Function):
         z = torch.empty((B, L, H, P), dtype=dt_, device=dev)
         x = torch.empty_like(z)
         if _HAVE_TRITON_SPLIT and B == 1 and per_head.is_contiguous() and per_head.is_cuda and (P & (P - 1)) == 0:
-            dt = torch.empty((B, L, H), dtype=dt_, device=dev)
+            dt = torch.empty((B, H, L), dtype=dt_, device=dev)
             A = torch.empty_like(dt)
             trap = torch.empty((B, H, L), dtype=dt_, device=dev)
             grid = (triton.cdiv(L, _SPLIT_BT), triton.cdiv(H, _SPLIT_HB))
@@ -202,8 +202,8 @@ class _SplitZXDtATrap(torch.autograd.Function):
         else:
             z.copy_(per_head[..., :P].transpose(0, 1))
             x.copy_(per_head[..., P:2 * P].transpose(0, 1))
-            dt = per_head[..., 2 * P].transpose(0, 1).contiguous()
-            A = per_head[..., 2 * P + 1].transpose(0, 1).contiguous()
+            dt = per_head[..., 2 * P].permute(1, 2, 0).contiguous()
+            A = per_head[..., 2 * P + 1].permute(1, 2, 0).contiguous()
             trap = per_head[..., 2 * P + 2].permute(1, 2, 0).contiguous()
         return z, x, dt, A, trap
 
@@ -218,12 +218,12 @@ class _SplitZXDtATrap(torch.autograd.Function):
             fill = lambda t, shape: (torch.zeros(shape, dtype=dty, device=dev) if t is None  # noqa: E731
                                      else t.to(dty).contiguous())
             grid = (triton.cdiv(L, _SPLIT_BT), triton.cdiv(H, _SPLIT_HB))
-            _split_zx_bwd_kernel[grid](g, fill(dz, (B, L, H, P)), fill(dx, (B, L, H, P)), fill(ddt, (B, L, H)),
-                                       fill(dA, (B, L, H)), fill(dtrap, (B, H, L)), L, H, P=P, BT=_SPLIT_BT,
+            _split_zx_bwd_kernel[grid](g, fill(dz, (B, L, H, P)), fill(dx, (B, L, H, P)), fill(ddt, (B, H, L)),
+                                       fill(dA, (B, H, L)), fill(dtrap, (B, H, L)), L, H, P=P, BT=_SPLIT_BT,
                                        HB=_SPLIT_HB, num_warps=4)
             return g, None
         for t, sl, perm in ((dz, slice(0, P), (1, 0, 2, 3)), (dx, slice(P, 2 * P), (1, 0, 2, 3)),
-                            (ddt, 2 * P, (1, 0, 2)), (dA, 2 * P + 1, (1, 0, 2)), (dtrap, 2 * P + 2, (2, 0, 1))):
+                            (ddt, 2 * P, (2, 0, 1)), (dA, 2 * P + 1, (2, 0, 1)), (dtrap, 2 * P + 2, (2, 0, 1))):
             dst = g[..., sl]
             if t is None:
                 dst.zero_()
@@ -555,7 +555,7 @@ class FastMamba3(MegatronModule):
         # (built below), NOT by folding windows into the batch dim. The kernel runs
         # at B=1 with the full sequence; the static-shape patch keeps it fast.
         per_head = zxdtAtrap.view(*zxdtAtrap.shape[:-1], self.nheads_local_tp, 2*self.headdim+3)
-        # z, x: (B, L, H, p) contiguous; dt, A: (B, L, H); trap: (B, H, L)
+        # z, x: (B, L, H, p) contiguous; dt, A, trap: (B, H, L) (the layout of the kernel's ADT / DT / Trap)
         z, x, dt, A, trap = _SplitZXDtATrap.apply(per_head, self.headdim)
         dt = dt.to(torch.float32)
 
@@ -565,9 +565,9 @@ class FastMamba3(MegatronModule):
         C = rearrange(C, "l b (G r n) -> l b r G n", G=self.ngroups, r=self.mimo_dim)
         nvtx_range_pop(suffix="M3_input_proj")
 
-        _A = -F.softplus(A.to(torch.float32)) # (B, L, N)
+        _A = -F.softplus(A.to(torch.float32)) # (B, N, L)
         _A = torch.clamp(_A, max=-self.A_floor)
-        dt = F.softplus(dt + self.dt_bias) # (B, L, N)
+        dt = F.softplus(dt + self.dt_bias[:, None]) # (B, N, L)
         ADT = _A * dt
 
         nvtx_range_push(suffix="M3_mimo_BC_norm")
@@ -592,8 +592,6 @@ class FastMamba3(MegatronModule):
         # the TileLang path, materialize it with .contiguous() as before)
         angle = angle.contiguous().unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, H, S)
 
-        ADT = rearrange(ADT, "b l n -> b n l")
-        dt = rearrange(dt, "b l n -> b n l")
 
         # cu_seqlens: reset the SSM state at artificial_seq_len window boundaries
         # AND document boundaries (packed-sequence isolation). This replaces the
