@@ -178,8 +178,8 @@ def get_dragon_block_spec(
             moe=moe,
         ),
     )
-    if vp_stage is not None or pp_rank is not None:
-        num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
+    if vp_stage is not None or pp_rank is not None or config.pipeline_model_parallel_size > 1:
+        num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)   # this stage's share (PP without VPP too)
     else:
         num_layers = config.num_layers
     
