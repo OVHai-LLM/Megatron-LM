@@ -2800,6 +2800,7 @@ class TransformerConfig(ModelParallelConfig):
                 "qkv_linear",
                 "gdp_qkv",
                 "shortcut_post_norm",
+                "mixer_proj",  # Dragon: input of the mixer output projection (every layer, Mamba-3 included)
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
