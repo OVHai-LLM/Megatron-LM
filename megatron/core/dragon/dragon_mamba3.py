@@ -232,6 +232,26 @@ class _SplitZXDtATrap(torch.autograd.Function):
         return g, None
 
 
+class _SplitLastDim(torch.autograd.Function):
+    """Contiguous pieces of the last dimension; the backward is one torch.cat (instead of a zero-filled
+    full-size gradient per piece, summed by autograd)."""
+
+    @staticmethod
+    def forward(ctx, x, sizes):
+        ctx.sizes = sizes
+        outs, off = [], 0
+        for n in sizes:
+            outs.append(x[..., off:off + n].contiguous())
+            off += n
+        return tuple(outs)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        ref = next(g for g in grads if g is not None)
+        gs = [g if g is not None else ref.new_zeros(*ref.shape[:-1], n) for g, n in zip(grads, ctx.sizes)]
+        return torch.cat([g.to(ref.dtype) for g in gs], dim=-1), None
+
+
 class _CanonGradStrides(torch.autograd.Function):
     """Identity fwd; canonicalize the gradient's strides in bwd.
 
@@ -539,10 +559,8 @@ class FastMamba3(MegatronModule):
         z, x, dt, A, trap = _SplitZXDtATrap.apply(per_head, self.headdim)
         dt = dt.to(torch.float32)
 
-        off = 0
-        B     = BCangle[..., off : off + self.ngroups*self.mimo_dim*self.d_state]; off += self.ngroups*self.mimo_dim*self.d_state
-        C     = BCangle[..., off : off + self.ngroups*self.mimo_dim*self.d_state]; off += self.ngroups*self.mimo_dim*self.d_state
-        angle = BCangle[..., off :]
+        nbc = self.ngroups*self.mimo_dim*self.d_state
+        B, C, angle = _SplitLastDim.apply(BCangle, (nbc, nbc, BCangle.shape[-1] - 2 * nbc))
         B = rearrange(B, "l b (G r n) -> l b r G n", G=self.ngroups, r=self.mimo_dim)
         C = rearrange(C, "l b (G r n) -> l b r G n", G=self.ngroups, r=self.mimo_dim)
         nvtx_range_pop(suffix="M3_input_proj")
