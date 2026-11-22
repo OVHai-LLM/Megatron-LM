@@ -16,6 +16,10 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_disable_offload,
+    fine_grained_offloading_enable_offload,
+)
 from megatron.core.dragon.offload_compat import (
     fine_grained_offloading_set_last_layer,
 )
@@ -451,10 +455,22 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
     ):
         """Forward method with activation checkpointing."""
 
-        def custom(start: int, end: int):
+        def custom(start: int, end: int, recomputed: bool = False):
             def custom_forward(
                 hidden_states, attention_mask, rotary_pos_emb
             ):
+                # A recomputed layer keeps only its input: offloading its activations would copy them
+                # to the host during the recompute and reload them synchronously right after.
+                no_offload = recomputed and self.config.fine_grained_activation_offloading
+                if no_offload:
+                    fine_grained_offloading_disable_offload()
+                try:
+                    return _run_layers(hidden_states, attention_mask, rotary_pos_emb)
+                finally:
+                    if no_offload:
+                        fine_grained_offloading_enable_offload()
+
+            def _run_layers(hidden_states, attention_mask, rotary_pos_emb):
                 for index in range(start, end):
                     layer = self._get_layer(index)
 
@@ -517,7 +533,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
             layer_idx = 0
             while layer_idx < self.num_layers_per_pipeline_rank:
                 hidden_states = checkpoint_handler(
-                    custom(layer_idx, layer_idx + self.config.recompute_num_layers)
+                    custom(layer_idx, layer_idx + self.config.recompute_num_layers, recomputed=True)
                 )
 
                 layer_idx += self.config.recompute_num_layers
@@ -538,7 +554,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                     layer_idx >= recompute_skip_num_layers
                     and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
                 ):
-                    hidden_states = checkpoint_handler(custom(layer_idx, layer_idx + 1))
+                    hidden_states = checkpoint_handler(custom(layer_idx, layer_idx + 1, recomputed=True))
                 else:
                     hidden_states = custom(layer_idx, layer_idx + 1)(
                         hidden_states, attention_mask, rotary_pos_emb
