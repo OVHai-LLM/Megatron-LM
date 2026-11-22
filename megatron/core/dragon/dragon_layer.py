@@ -501,12 +501,15 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         nvtx_range_push(suffix="mixer_proj")
         if self.offload_mixer_proj:
             y_mixer = fine_grained_offloading_group_start(y_mixer, name="mixer_proj")
+        y_mixer_in = y_mixer
         with get_fine_grained_offloading_context(self.offload_mixer_proj):
-            y_mixer, _ = self.mixer_proj(y_mixer)
+            y_mixer, _ = self.mixer_proj(y_mixer_in)
         if self.offload_mixer_proj:
+            # release the projection INPUT (offloaded to CPU), not its output which is used just below
             y_mixer, _ = fine_grained_offloading_group_commit(
-                y_mixer, None, name="mixer_proj", forced_released_tensors=[y_mixer]
+                y_mixer, None, name="mixer_proj", forced_released_tensors=[y_mixer_in]
             )
+        del y_mixer_in
         nvtx_range_pop(suffix="mixer_proj")
 
         if self.config.use_geodesic_norm:
