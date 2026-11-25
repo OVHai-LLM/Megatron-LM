@@ -1336,7 +1336,7 @@ def get_optimizer_param_scheduler(optimizer):
         beta3_warmup_steps=args.ademamix_beta3_warmup_steps if args.ademamix_beta3_warmup_steps is not None else args.train_iters,
         alpha_warmup_steps=args.ademamix_alpha_warmup_steps if args.ademamix_alpha_warmup_steps is not None else args.train_iters,
         use_completedp=args.use_completedp,
-        rhosq_adjusted=args.train_iters_base / args.train_iters if args.use_completedp else None,
+        rhosq_adjusted=args.train_iters_base / (args.completedp_train_iters or args.train_iters) if args.use_completedp else None,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
@@ -1344,6 +1344,19 @@ def get_optimizer_param_scheduler(optimizer):
     )
 
     return opt_param_scheduler
+
+
+def _print_lr_groups(optimizer, when):
+    """DRAGON_PRINT_LR_GROUPS=1: rank 0 prints every optimizer param group's LR hyperparameters."""
+    if optimizer is None or os.environ.get("DRAGON_PRINT_LR_GROUPS", "0") != "1":
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    for i, g in enumerate(optimizer.param_groups):
+        n = sum(p.numel() for p in g['params'])
+        print(f"[lr-groups {when}] {i}: max_lr={g.get('max_lr')} min_lr={g.get('min_lr')} lr={g.get('lr')} "
+              f"lr_mult={g.get('lr_mult')} wd_mult={g.get('wd_mult')} wd={g.get('weight_decay')} "
+              f"betas={g.get('betas')} step={g.get('step')} expert={g.get('is_expert_parallel')} numel={n}", flush=True)
 
 
 def setup_model_and_optimizer(
@@ -1388,7 +1401,7 @@ def setup_model_and_optimizer(
             args.use_uscaling,
             args.use_completedp,
             args.completedp_alpha,
-            math.sqrt(args.train_iters_base / args.train_iters) if args.use_completedp else None,
+            math.sqrt(args.train_iters_base / (args.completedp_train_iters or args.train_iters)) if args.use_completedp else None,
             args.hidden_size / args.hidden_size_base if args.use_completedp else None,
             len(args.layers_mixer_config) / len(args.layers_mixer_config_base) if args.use_completedp else None,
             no_wd_decay_cond,
@@ -1469,6 +1482,16 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
+        # Loading the optimizer restores every param-group hyperparameter from the checkpoint,
+        # max_lr / min_lr included, and get_lr() prefers the group's value over the scheduler's:
+        # --override-opt-param-scheduler alone cannot change the LR of a resumed run. With that
+        # flag, put the current config's max_lr / min_lr back on the loaded groups (same order);
+        # everything else (Adam moments, the FusedAdam 'step') stays as loaded.
+        lr_snapshot = None
+        if optimizer is not None and args.override_opt_param_scheduler:
+            lr_snapshot = [(g.get('max_lr'), g.get('min_lr')) for g in optimizer.param_groups]
+        _print_lr_groups(optimizer, "before load")
+
         iters, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
             optimizer,
@@ -1478,6 +1501,22 @@ def setup_model_and_optimizer(
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
+        _print_lr_groups(optimizer, "as loaded")
+        if lr_snapshot is not None:
+            groups = optimizer.param_groups
+            assert len(groups) == len(lr_snapshot), (len(groups), len(lr_snapshot))
+            for g, (max_lr, min_lr) in zip(groups, lr_snapshot):
+                if max_lr is not None:
+                    g['max_lr'] = max_lr
+                if min_lr is not None:
+                    g['min_lr'] = min_lr
+            if opt_param_scheduler is not None:
+                if args.reset_training:
+                    # A new phase from a finished run: restart the LR schedule (warmup / decay counted
+                    # from 0) while keeping the loaded optimizer state.
+                    opt_param_scheduler.num_steps = 0
+                opt_param_scheduler.step(increment=0)  # recompute each group's lr / wd
+        _print_lr_groups(optimizer, "after load")
         if not args.reset_training:
             args.iteration = iters
         else:

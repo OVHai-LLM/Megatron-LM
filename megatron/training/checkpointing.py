@@ -1657,6 +1657,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         args.consumed_valid_samples = getattr(checkpoint_args,
                                               'consumed_valid_samples', 0)
+        if args.reset_training:
+            # A new phase (new data, new GBS): the samplers restart at 0 (legacy/data/data_samplers.py), so the
+            # counters must too, or this run's checkpoints carry the seed's counts and cannot be resumed.
+            print_rank_0("Reset training: setting consumed train / valid samples to 0")
+            args.consumed_train_samples = 0
+            args.skipped_train_samples = 0
+            args.consumed_valid_samples = 0
+            update_num_microbatches(consumed_samples=0, verbose=True)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 

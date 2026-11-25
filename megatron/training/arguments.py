@@ -1790,6 +1790,11 @@ def _add_dragon_args(parser):
     # completedp
     group.add_argument('--use-completedp', action='store_true')
     group.add_argument('--completedp-alpha', type=float, default=0.5)
+    group.add_argument('--completedp-train-iters', type=int, default=None,
+                       help='Training horizon T used by CompleteDP for the LR / WD / eps multipliers '
+                       '(through train_iters_base / T). Defaults to --train-iters. Set it to the original '
+                       'run\'s value when continuing a checkpoint with a short phase (context extension, SFT): '
+                       'with T = a few thousand iterations the LR multipliers grow ~sqrt(T0 / T).')
     group.add_argument('--init-method-output-std', type=float, default=None)
     group.add_argument('--init-method-embedding-std', type=float, default=None)
     group.add_argument('--normalize-embeddings', action='store_true',
