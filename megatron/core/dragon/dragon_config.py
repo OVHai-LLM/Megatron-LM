@@ -219,6 +219,13 @@ class DragonConfig(ModelParallelConfig):
     artificial_seq_len: int = 0
     """Artificial sequence length to use for all mixer layers."""
 
+    quack_chunked_lce: bool = False
+    """Compute the LM loss with QuACK's chunked linear cross entropy (no [S, V/TP] logits; see
+    megatron/core/dragon/quack_head_loss.py). Training/eval loss only; logits paths are unchanged."""
+
+    quack_lce_chunk_size: int = 4096
+    """Tokens per logits chunk for --quack-chunked-lce ([chunk, V] bf16 lives at a time)."""
+
     window_attn_skip_freq: Optional[Union[int, List[int]]] = None
     """Frequency of full attention layers among sliding window attention layers. Accepts either:
     - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.

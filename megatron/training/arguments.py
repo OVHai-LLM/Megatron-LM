@@ -1772,6 +1772,10 @@ def _add_dragon_args(parser):
     group.add_argument('--slw-end', type=int, default=0)
     group.add_argument('--slw-increment', type=int, default=0)
     group.add_argument('--artificial-seq-len', type=int, default=0)
+    group.add_argument('--quack-chunked-lce', action='store_true',
+                       help='LM loss via QuACK chunked linear cross entropy: the head runs sequence-parallel '
+                       'against the TP-gathered output weight and never materializes the logits.')
+    group.add_argument('--quack-lce-chunk-size', type=int, default=4096)
     group.add_argument('--moe-router-type', type=str, default="classic")
     group.add_argument("--no-mixer-gn", dest="mixer_gn", action="store_false")
     group.add_argument('--reset-training', action='store_true')

@@ -39,6 +39,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.dragon.dragon_block import DragonBlock
 from megatron.core.dragon.dragon_config import DragonConfig
+from megatron.core.dragon.quack_head_loss import sequence_parallel_chunked_lce
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 
@@ -686,6 +687,26 @@ class DragonModel(LanguageModule):
                 hidden_states = inference_context.last_token_logits(
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
+
+        if (
+            self.config.quack_chunked_lce
+            and labels is not None
+            and not just_logits
+            and not in_inference_mode
+            and not self.config.normalize_lm_head
+            and self.config.mtp_num_layers is None
+            and self.output_layer.sequence_parallel
+        ):
+            # Loss without the [S, V/TP] logits (QuACK chunked LCE, sequence-parallel head).
+            return sequence_parallel_chunked_lce(
+                hidden_states,
+                self.output_layer.weight,
+                labels,
+                loss_mask,
+                self.pg_collection.tp,
+                chunk_size=self.config.quack_lce_chunk_size,
+                grad_accum_fusion=self.config.gradient_accumulation_fusion,
+            )
 
         logits = self._compute_logits(hidden_states)
 
