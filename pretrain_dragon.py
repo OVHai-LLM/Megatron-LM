@@ -2,6 +2,7 @@
 
 """Pretrain and SFT GPT."""
 
+import os
 import torch
 
 from functools import partial
@@ -233,6 +234,50 @@ def debug_batch(tokens, position_ids, cu_seqlens, max_seqlen):
     print_rank_0("-" * 30)
 
 
+
+_NAN_HOOKS_INSTALLED = False
+
+
+def _install_nan_hooks(model):
+    """DRAGON_NAN_HOOKS=1: print (every rank) the first modules whose forward output is non-finite, the
+    batch's cu_seqlens summary, and non-finite parameters. Debug aid for the Jean Zay port."""
+    global _NAN_HOOKS_INSTALLED
+    if _NAN_HOOKS_INSTALLED or os.environ.get("DRAGON_NAN_HOOKS", "0") != "1":
+        return
+    _NAN_HOOKS_INSTALLED = True
+    rank = torch.distributed.get_rank()
+    reported = {"n": 0}
+    for name, p in model.named_parameters():
+        if not torch.isfinite(p.detach()).all():
+            print(f"[nan-hook r{rank}] non-finite PARAM {name}", flush=True)
+
+    def first(t):
+        if isinstance(t, torch.Tensor):
+            return t
+        if isinstance(t, (tuple, list)):
+            for x in t:
+                y = first(x)
+                if y is not None:
+                    return y
+        return None
+
+    def mk(name):
+        def hook(mod, inp, out):
+            if reported["n"] >= 5:
+                return
+            o = first(out)
+            if o is not None and o.is_floating_point() and not torch.isfinite(o).all():
+                i = first(inp)
+                ifin = None if i is None or not i.is_floating_point() else bool(torch.isfinite(i).all())
+                reported["n"] += 1
+                print(f"[nan-hook r{rank}] non-finite OUTPUT of {name} ({type(mod).__name__}) "
+                      f"shape={tuple(o.shape)} nonfinite={(~torch.isfinite(o)).sum().item()} input_finite={ifin}", flush=True)
+        return hook
+
+    for name, mod in model.named_modules():
+        mod.register_forward_hook(mk(name))
+
+
 def forward_step(data_iterator, model: DragonModel, return_schedule_plan: bool = False):
     """Forward training step.
 
@@ -252,6 +297,12 @@ def forward_step(data_iterator, model: DragonModel, return_schedule_plan: bool =
         tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen = get_batch(data_iterator, vp_stage)
         #print(f"PP rank : {parallel_state.get_pipeline_model_parallel_rank()} VPP rank : {parallel_state.get_virtual_pipeline_model_parallel_rank()} got batch with tokens shape {tokens.shape if tokens is not None else 'None'} and position_ids shape {position_ids.shape if position_ids is not None else 'None'} and cu_seqlens shape {cu_seqlens.shape if cu_seqlens is not None else 'None'} and max_seqlen {max_seqlen if max_seqlen is not None else 'None'}")
     timers('batch-generator').stop()
+
+    _install_nan_hooks(model)
+    if os.environ.get("DRAGON_NAN_HOOKS", "0") == "1" and cu_seqlens is not None:
+        cs = cu_seqlens.view(-1)
+        print(f"[nan-hook r{torch.distributed.get_rank()}] tokens={tuple(tokens.shape)} n_cu={cs.numel()} "
+              f"cu_head={cs[:4].tolist()} cu_tail={cs[-3:].tolist()} max_seqlen={max_seqlen}", flush=True)
 
     #debug_batch(tokens, position_ids, cu_seqlens, max_seqlen)
 
