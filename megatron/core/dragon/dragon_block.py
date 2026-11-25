@@ -445,6 +445,8 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
+        window_size: Optional[Tuple[int, int]] = None,
+        input_ids: Optional[Tensor] = None,
     ):
         """Forward method with activation checkpointing."""
 
@@ -477,6 +479,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                             attention_mask=attention_mask,
                             rotary_pos_emb=rotary_pos_emb,
                             attention_bias=attention_bias,
+                            window_size=window_size,
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                         )
@@ -512,7 +515,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
             # A method to further reduce memory usage reducing checkpoints.
             layer_idx = 0
             while layer_idx < self.num_layers_per_pipeline_rank:
-                hidden_states, context = checkpoint_handler(
+                hidden_states = checkpoint_handler(
                     custom(layer_idx, layer_idx + self.config.recompute_num_layers)
                 )
 
@@ -534,10 +537,10 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                     layer_idx >= recompute_skip_num_layers
                     and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
                 ):
-                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
+                    hidden_states = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
-                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                    hidden_states = custom(layer_idx, layer_idx + 1)(
+                        hidden_states, attention_mask, rotary_pos_emb
                     )
         else:
             raise ValueError("Invalid activation recompute method.")

@@ -113,6 +113,11 @@ class SFTTokenizer(MegatronLegacyTokenizer):
         return self._tokenizer.eos_token_id
 
     @property
+    def eos(self):
+        """EOS token ID (MegatronDataset reads it; the base class raises NotImplementedError)."""
+        return self._tokenizer.eos_token_id
+
+    @property
     def vocab(self):
         """Vocab."""
         return NotImplementedError("not used")

@@ -527,6 +527,14 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         group = mpu.get_tensor_model_parallel_group()
         device = torch.cuda.current_device()
 
+        # The receivers allocate int64 (1, nseq) / (1,) buffers below: send exactly that, whatever
+        # the dataset produced (the packed SFT dataset yields int32, and a dtype mismatch makes the
+        # NCCL broadcast sizes differ between ranks -> hang).
+        if cu_seqlens is not None:
+            cu_seqlens = cu_seqlens.to(torch.int64).reshape(1, -1).contiguous()
+        if max_seqlen is not None:
+            max_seqlen = max_seqlen.to(torch.int64).reshape(-1)[:1].contiguous()
+
         # 1) broadcast Nseq (second dim of cu_seqlens)
         if cu_seqlens is not None:
             # src rank
